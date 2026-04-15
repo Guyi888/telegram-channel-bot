@@ -462,5 +462,6 @@ def build_submission_conversation() -> ConversationHandler:
         fallbacks=[CommandHandler("cancel", cancel_submission)],
         per_user=True,
         per_chat=True,
+        per_message=False,
         allow_reentry=True,
     )
