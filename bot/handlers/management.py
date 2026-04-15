@@ -98,6 +98,11 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"✅ 已添加来源频道：{escape_html(chat.title or raw)} (<code>{chat.id}</code>)",
             parse_mode="HTML",
         )
+        # Notify Pyrogram collector to refresh its monitored set immediately
+        collector = context.application.bot_data.get("collector")
+        if collector:
+            sources = await db.get_source_channels()
+            collector.refresh_sources_sync([s["channel_id"] for s in sources])
     except Exception as e:
         await update.message.reply_text(f"❌ 添加失败：{e}")
 
@@ -114,6 +119,11 @@ async def cmd_delsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if removed:
             await db.log_action(update.effective_user.id, "del_source_channel", str(chat.id))
             await update.message.reply_text(f"✅ 已移除来源频道：<code>{chat.id}</code>", parse_mode="HTML")
+            # Notify Pyrogram collector to refresh its monitored set immediately
+            collector = context.application.bot_data.get("collector")
+            if collector:
+                sources = await db.get_source_channels()
+                collector.refresh_sources_sync([s["channel_id"] for s in sources])
         else:
             await update.message.reply_text("⚠️ 该频道不在来源列表中。")
     except Exception as e:

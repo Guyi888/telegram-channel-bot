@@ -29,7 +29,7 @@ from bot.handlers.callbacks import (
     handle_category_approve,
     handle_reject_reason,
     handle_custom_reason_start,
-    handle_admin_edit_content,
+    build_admin_edit_conversation,
 )
 
 logging.basicConfig(
@@ -87,6 +87,8 @@ async def post_init(application: Application) -> None:
         try:
             from collector.channel_collector import ChannelCollector, run_queue_consumer
             collector = ChannelCollector(application.bot.token)
+            # Store reference so management handlers can call refresh_sources_sync()
+            application.bot_data["collector"] = collector
             asyncio.create_task(collector.start())
             asyncio.create_task(run_queue_consumer(application.bot))
             logger.info("Collector and queue consumer tasks started.")
@@ -172,9 +174,13 @@ def build_application() -> Application:
         CallbackQueryHandler(handle_reaction, pattern=r"^react:(like|dislike):\d+$")
     )
 
-    # Review callbacks
+    # Admin edit conversation (must be registered before plain review callbacks
+    # so it intercepts review:edit:* before the catch-all handler sees it)
+    app.add_handler(build_admin_edit_conversation())
+
+    # Review callbacks (approve / reject only — edit is handled by the conversation above)
     app.add_handler(
-        CallbackQueryHandler(handle_review_callback, pattern=r"^review:(approve|reject|edit):\d+$")
+        CallbackQueryHandler(handle_review_callback, pattern=r"^review:(approve|reject):\d+$")
     )
     app.add_handler(
         CallbackQueryHandler(handle_category_approve, pattern=r"^cat_approve:\d+:.+$")

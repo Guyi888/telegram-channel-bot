@@ -327,9 +327,20 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
     if action == "reedit":
-        await query.edit_message_text(
-            "✏️ 请重新发送您的投稿内容："
-        )
+        sub = context.user_data.get("submission", {})
+        ctype = sub.get("content_type", "text")
+        ctype_label = {"text": "文字", "photo": "图片", "video": "视频",
+                       "document": "文件", "album": "相册", "audio": "音频"}.get(ctype, "内容")
+        original_text = sub.get("message_data", {}).get("text", "") or ""
+        if original_text:
+            preview = original_text[:300] + ("…" if len(original_text) > 300 else "")
+            prompt = (
+                f"✏️ 请重新发送您的投稿内容：\n\n"
+                f"<b>原内容（{ctype_label}）：</b>\n{preview}"
+            )
+        else:
+            prompt = f"✏️ 请重新发送您的投稿内容（原内容为 {ctype_label}，无文字）："
+        await query.edit_message_text(prompt, parse_mode="HTML")
         context.user_data.pop("submission", None)
         return WAITING_CONTENT
 

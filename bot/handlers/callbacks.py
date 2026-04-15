@@ -86,6 +86,21 @@ async def _do_approve(query, admin, submission_id: int, submission: dict, contex
 
     # Let admin confirm/change category
     cat_names = await get_all_category_names()
+
+    # When no categories have been created yet, skip the picker and show a simple confirm button
+    if not cat_names:
+        await query.edit_message_text(
+            f"📋 自动识别分类：<b>#{category}</b>（尚未创建其他分类）",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"✅ 确认发布（#{category}）",
+                    callback_data=f"cat_approve:{submission_id}:{category}",
+                )
+            ]]),
+        )
+        return
+
     keyboard_rows = []
     row = []
     for name in cat_names:
@@ -105,7 +120,7 @@ async def _do_approve(query, admin, submission_id: int, submission: dict, contex
     ])
 
     await query.edit_message_text(
-        f"📋 系统自动识别分类：<b>#{category}</b>（点击修改或确认）",
+        f"📋 系统自动识别分类：<b>#{category}</b>（点击其他分类可修改，或直接确认）",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard_rows),
     )
@@ -266,80 +281,168 @@ async def _finalize_rejection(bot, target, admin, submission_id: int, reason: st
     await _notify_submitter_rejected(bot, submission, reason)
 
 
-async def _do_edit_flow(query, admin, submission_id: int, submission: dict, context) -> None:
-    """Admin wants to edit content before publishing — ask for new content."""
+# ── Admin edit ConversationHandler ───────────────────────────────────────────
+
+ADMIN_EDITING = 200  # Conversation state
+
+
+async def handle_review_edit_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """
+    Entry point for the admin-edit ConversationHandler.
+    Triggered by the '✏️ 编辑后发布' button (review:edit:<id>).
+    Sends a *reply* (not an edit) so the original review notice stays visible.
+    """
+    query = update.callback_query
+    await query.answer()
+    admin = update.effective_user
+
+    if not await db.is_admin(admin.id):
+        await query.answer("⛔ 无权限", show_alert=True)
+        return ConversationHandler.END
+
+    parts = query.data.split(":")
+    submission_id = int(parts[2])
+
+    submission = await db.get_submission(submission_id)
+    if not submission:
+        await query.edit_message_text("⚠️ 投稿不存在或已被处理。")
+        return ConversationHandler.END
+
+    if submission["status"] != "pending":
+        await query.edit_message_text(
+            f"⚠️ 该投稿已被处理（状态：{submission['status']}）。"
+        )
+        return ConversationHandler.END
+
     context.user_data["edit_submission_id"] = submission_id
     context.user_data["edit_original"] = submission
-    await query.edit_message_text(
+
+    # reply_text keeps the original review notice above; edit_message_text would destroy it
+    await query.message.reply_text(
         "✏️ 请发送修改后的投稿内容（文字 / 图片 / 视频 / 文件）：\n"
-        "发送 /skip 保持原内容直接发布。"
+        "发送 /skip 保持原内容直接发布，/cancel 取消编辑。"
     )
+    return ADMIN_EDITING
 
 
 async def handle_admin_edit_content(
     update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Receive the admin's replacement content and publish it."""
+) -> int:
+    """Receive the admin's replacement content, publish it, then end the conversation."""
     msg = update.effective_message
     admin = update.effective_user
-
-    if not await db.is_admin(admin.id):
-        return
 
     submission_id = context.user_data.pop("edit_submission_id", None)
     original = context.user_data.pop("edit_original", None)
     if not submission_id or not original:
-        return
+        await msg.reply_text("⚠️ 找不到待编辑的投稿，操作已结束。")
+        return ConversationHandler.END
 
     target = await db.get_target_channel()
     if not target:
         await msg.reply_text("⚠️ 未设置目标频道。")
-        return
+        return ConversationHandler.END
 
-    if msg.text == "/skip":
-        # Publish original
-        category = await classify_text(original["message_data"].get("text", ""))
-        msg_id = await publisher.publish_from_submission(
-            context.bot, target, original, category=category
-        )
+    from utils.helpers import extract_text as _et
+    text = _et(msg)
+    if msg.photo:
+        data = {"file_id": msg.photo[-1].file_id, "text": text}
+        ctype = "photo"
+    elif msg.video:
+        data = {"file_id": msg.video.file_id, "text": text}
+        ctype = "video"
+    elif msg.document:
+        data = {"file_id": msg.document.file_id, "text": text}
+        ctype = "document"
     else:
-        # Build replacement submission from admin's message
-        from utils.helpers import extract_text as _et
-        text = _et(msg)
-        if msg.photo:
-            data = {"file_id": msg.photo[-1].file_id, "text": text}
-            ctype = "photo"
-        elif msg.video:
-            data = {"file_id": msg.video.file_id, "text": text}
-            ctype = "video"
-        elif msg.document:
-            data = {"file_id": msg.document.file_id, "text": text}
-            ctype = "document"
-        else:
-            data = {"text": text}
-            ctype = "text"
+        data = {"text": text}
+        ctype = "text"
 
-        replacement = dict(original)
-        replacement["content_type"] = ctype
-        replacement["message_data"] = data
+    replacement = dict(original)
+    replacement["content_type"] = ctype
+    replacement["message_data"] = data
 
-        category = await classify_text(text)
-        msg_id = await publisher.publish_from_submission(
-            context.bot, target, replacement, category=category
-        )
+    category = await classify_text(text)
+    msg_id = await publisher.publish_from_submission(
+        context.bot, target, replacement, category=category
+    )
 
     if msg_id:
-        await db.update_submission_status(
-            submission_id, "approved", reviewed_by=admin.id
-        )
-        await db.log_action(
-            admin.id, "edit_and_approve",
-            f"submission_id={submission_id}",
-        )
+        await db.update_submission_status(submission_id, "approved", reviewed_by=admin.id)
+        await db.log_action(admin.id, "edit_and_approve", f"submission_id={submission_id}")
         await msg.reply_text(f"✅ 投稿 #{submission_id} 已编辑并发布。")
         await _notify_submitter_approved(context.bot, original)
     else:
         await msg.reply_text("❌ 发布失败，请检查目标频道配置。")
+
+    return ConversationHandler.END
+
+
+async def handle_skip_edit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """/skip inside the admin-edit conversation — publish original content unchanged."""
+    msg = update.effective_message
+    admin = update.effective_user
+
+    submission_id = context.user_data.pop("edit_submission_id", None)
+    original = context.user_data.pop("edit_original", None)
+    if not submission_id or not original:
+        await msg.reply_text("⚠️ 找不到待编辑的投稿。")
+        return ConversationHandler.END
+
+    target = await db.get_target_channel()
+    if not target:
+        await msg.reply_text("⚠️ 未设置目标频道。")
+        return ConversationHandler.END
+
+    category = await classify_text(original["message_data"].get("text", ""))
+    msg_id = await publisher.publish_from_submission(
+        context.bot, target, original, category=category
+    )
+    if msg_id:
+        await db.update_submission_status(submission_id, "approved", reviewed_by=admin.id)
+        await db.log_action(admin.id, "edit_and_approve", f"submission_id={submission_id}")
+        await msg.reply_text(f"✅ 投稿 #{submission_id} 已发布（保持原内容）。")
+        await _notify_submitter_approved(context.bot, original)
+    else:
+        await msg.reply_text("❌ 发布失败，请检查目标频道配置。")
+
+    return ConversationHandler.END
+
+
+async def cancel_admin_edit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Cancel the admin-edit conversation."""
+    context.user_data.pop("edit_submission_id", None)
+    context.user_data.pop("edit_original", None)
+    await update.effective_message.reply_text("❌ 已取消编辑操作。")
+    return ConversationHandler.END
+
+
+def build_admin_edit_conversation() -> ConversationHandler:
+    """Return a ConversationHandler that manages the admin content-edit flow."""
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(handle_review_edit_start, pattern=r"^review:edit:\d+$")
+        ],
+        states={
+            ADMIN_EDITING: [
+                CommandHandler("skip", handle_skip_edit),
+                MessageHandler(
+                    filters.ALL & ~filters.COMMAND,
+                    handle_admin_edit_content,
+                ),
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_admin_edit)],
+        per_user=True,
+        per_chat=True,
+        per_message=False,
+    )
 
 
 # ── Submitter notifications ───────────────────────────────────────────────────
