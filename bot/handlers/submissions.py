@@ -158,34 +158,43 @@ async def _collect_media_group(
         _pending_tasks[gid].cancel()
 
     async def _flush():
-        await asyncio.sleep(config.MEDIA_GROUP_DELAY)
-        messages = _pending_groups.pop(gid, [])
-        messages.sort(key=lambda m: m.message_id)
+        # Always set the event even if an exception occurs, to unblock the waiter
+        try:
+            await asyncio.sleep(config.MEDIA_GROUP_DELAY)
+            messages = _pending_groups.pop(gid, [])
+            messages.sort(key=lambda m: m.message_id)
 
-        items = []
-        caption = ""
-        for i, m in enumerate(messages):
-            if i == 0:
-                caption = extract_text(m)
-            if m.photo:
-                items.append({"type": "photo", "file_id": m.photo[-1].file_id})
-            elif m.video:
-                items.append({"type": "video", "file_id": m.video.file_id})
-            elif m.document:
-                items.append({"type": "document", "file_id": m.document.file_id})
+            items = []
+            caption = ""
+            for i, m in enumerate(messages):
+                if i == 0:
+                    caption = extract_text(m)
+                if m.photo:
+                    items.append({"type": "photo", "file_id": m.photo[-1].file_id})
+                elif m.video:
+                    items.append({"type": "video", "file_id": m.video.file_id})
+                elif m.document:
+                    items.append({"type": "document", "file_id": m.document.file_id})
 
-        context.user_data["submission"] = {
-            "content_type": "album",
-            "message_data": {"items": items, "text": caption},
-            "raw_text": caption,
-        }
-        _group_resolved[gid].set()
+            context.user_data["submission"] = {
+                "content_type": "album",
+                "message_data": {"items": items, "text": caption},
+                "raw_text": caption,
+            }
+        finally:
+            # Always unblock the waiter — even on error
+            event = _group_resolved.get(gid)
+            if event:
+                event.set()
 
     task = asyncio.get_event_loop().create_task(_flush())
     _pending_tasks[gid] = task
 
-    # Wait for aggregation
-    await _group_resolved.pop(gid, asyncio.Event()).wait()
+    # Wait for aggregation — hold a reference before the task can pop it
+    event = _group_resolved.get(gid)
+    if event:
+        await event.wait()
+    _group_resolved.pop(gid, None)
     return await _show_signature_options_raw(msg, context)
 
 

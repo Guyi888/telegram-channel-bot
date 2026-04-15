@@ -122,7 +122,8 @@ async def handle_category_approve(
     if not await db.is_admin(admin.id):
         return
 
-    parts = query.data.split(":")
+    # Split into max 3 parts so category names containing ':' are preserved
+    parts = query.data.split(":", 2)
     submission_id = int(parts[1])
     category = parts[2]
 

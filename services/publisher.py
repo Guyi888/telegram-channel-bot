@@ -66,18 +66,25 @@ async def build_reply_markup(
 
 async def _send_with_retry(coro, retries: int = 3):
     """Wrap a send coroutine with RetryAfter / flood-wait handling."""
+    last_exc: Exception | None = None
     for attempt in range(retries):
         try:
             return await coro
         except RetryAfter as e:
             wait = e.retry_after + 1
-            logger.warning("Flood wait %ss — sleeping", wait)
+            logger.warning("Flood wait %ss — sleeping (attempt %s)", wait, attempt + 1)
+            last_exc = e
             await asyncio.sleep(wait)
         except TelegramError as e:
             logger.error("Telegram error (attempt %s): %s", attempt + 1, e)
+            last_exc = e
             if attempt == retries - 1:
                 raise
             await asyncio.sleep(2)
+    # RetryAfter exhausted all attempts — raise last exception
+    if last_exc:
+        raise last_exc
+    return None
 
 
 async def _append_category(text: str | None, category: str) -> str:

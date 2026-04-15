@@ -530,18 +530,24 @@ async def update_category(
     is_default: bool | None = None,
 ) -> None:
     async with aiosqlite.connect(_DB_PATH) as conn:
-        if name is not None:
-            await conn.execute(
-                "UPDATE categories SET name=? WHERE id=?", (name, cat_id))
-        if keywords is not None:
-            await conn.execute(
-                "UPDATE categories SET keywords=? WHERE id=?",
-                (json.dumps(keywords), cat_id))
-        if is_default is True:
-            await conn.execute("UPDATE categories SET is_default=0")
-            await conn.execute(
-                "UPDATE categories SET is_default=1 WHERE id=?", (cat_id,))
-        await conn.commit()
+        # Wrap all updates in a single transaction so is_default stays consistent
+        await conn.execute("BEGIN")
+        try:
+            if name is not None:
+                await conn.execute(
+                    "UPDATE categories SET name=? WHERE id=?", (name, cat_id))
+            if keywords is not None:
+                await conn.execute(
+                    "UPDATE categories SET keywords=? WHERE id=?",
+                    (json.dumps(keywords), cat_id))
+            if is_default is True:
+                await conn.execute("UPDATE categories SET is_default=0")
+                await conn.execute(
+                    "UPDATE categories SET is_default=1 WHERE id=?", (cat_id,))
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
 
 
 async def delete_category(cat_id: int) -> bool:
