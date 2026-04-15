@@ -2,6 +2,7 @@
 Central configuration module.
 All values are loaded from environment variables / .env file.
 """
+from __future__ import annotations
 import os
 from dotenv import load_dotenv
 
