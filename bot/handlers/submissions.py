@@ -41,30 +41,59 @@ WAITING_CUSTOM_NAME = 3
 CONFIRMING = 4
 WAITING_REJECT_REASON = 5  # Admin sub-state (handled in callbacks.py)
 
-# ── MediaGroup collection (same pattern as admin_forward) ─────────────────────
+# ── MediaGroup collection ─────────────────────────────────────────────────────
 _pending_groups: Dict[str, List[Message]] = defaultdict(list)
 _pending_tasks: Dict[str, asyncio.Task] = {}
-_group_resolved: Dict[str, asyncio.Event] = {}  # gid → resolved event
+_group_resolved: Dict[str, asyncio.Event] = {}
 
 
 # ── Conversation entry ────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /start — greet user and prompt for content."""
+    """Handle /start — show role-specific panel."""
     user = update.effective_user
 
     if await db.is_admin(user.id):
-        await update.message.reply_text(
-            "👋 您好，管理员！直接发送消息即可转发至目标频道。\n"
-            "使用 /status 查看运行状态。"
-        )
+        from bot.handlers.management import show_admin_main_panel
+        await show_admin_main_panel(update.message, context)
         return ConversationHandler.END
 
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 开始投稿", callback_data="user_action:submit")],
+        [InlineKeyboardButton("❓ 投稿须知", callback_data="user_action:help")],
+    ])
     await update.message.reply_text(
-        "👋 欢迎投稿！\n\n"
-        "请直接发送您想投稿的内容（文字、图片、视频、文件或相册均可）。\n"
-        "输入 /cancel 随时取消。"
+        "👋 欢迎使用投稿机器人！\n\n"
+        "您可以直接发送内容（文字、图片、视频、文件或相册）开始投稿，\n"
+        "也可以点击下方按钮。\n\n"
+        "输入 /cancel 随时取消。",
+        reply_markup=keyboard,
     )
+    return WAITING_CONTENT
+
+
+async def handle_user_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user panel button callbacks."""
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]
+
+    if action == "submit":
+        await query.edit_message_text(
+            "📝 请直接发送您想投稿的内容（文字、图片、视频、文件或相册）："
+        )
+        return WAITING_CONTENT
+    elif action == "help":
+        await query.edit_message_text(
+            "📋 <b>投稿须知</b>\n\n"
+            "• 支持文字、图片、视频、文件、相册\n"
+            "• 每天投稿次数有上限（由管理员设定）\n"
+            "• 内容需符合频道主题，含违规内容将被拒绝\n"
+            "• 审核结果将通过私信通知您\n\n"
+            "直接发送内容即可开始投稿！",
+            parse_mode="HTML",
+        )
+        return WAITING_CONTENT
     return WAITING_CONTENT
 
 
@@ -73,35 +102,24 @@ async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     msg = update.effective_message
 
-    # Blacklist check (silent drop)
     if await db.is_blacklisted(user.id):
         logger.info("Blacklisted user %s tried to submit", user.id)
         return ConversationHandler.END
 
-    # Rate-limit check — cooldown
     if await db.check_user_cooldown(user.id):
-        await msg.reply_text(
-            "⏳ 您的投稿过于频繁，已进入 24 小时冷却期，请稍后再试。"
-        )
+        await msg.reply_text("⏳ 您的投稿过于频繁，已进入 24 小时冷却期，请稍后再试。")
         return ConversationHandler.END
 
-    # Daily limit check
     daily_count = await db.count_user_submissions_today(user.id)
     limit = await db.get_submission_limit()
     if daily_count >= limit:
-        await msg.reply_text(
-            f"❌ 您今日的投稿次数已达上限（{limit} 条），请明天再试。"
-        )
+        await msg.reply_text(f"❌ 您今日的投稿次数已达上限（{limit} 条），请明天再试。")
         return ConversationHandler.END
 
-    # Rapid-fire check (3 submissions in 60 seconds → 24h cooldown)
-    recent = await db.count_user_submissions_in_window(
-        user.id, config.RATE_LIMIT_WINDOW_SECONDS)
+    recent = await db.count_user_submissions_in_window(user.id, config.RATE_LIMIT_WINDOW_SECONDS)
     if recent >= config.RATE_LIMIT_COUNT:
         await db.set_user_cooldown(user.id, config.COOLDOWN_HOURS)
-        await msg.reply_text(
-            "⚠️ 您投稿太频繁，已触发冷却机制，24 小时内无法继续投稿。"
-        )
+        await msg.reply_text("⚠️ 您投稿太频繁，已触发冷却机制，24 小时内无法继续投稿。")
         return ConversationHandler.END
 
     if msg.media_group_id:
@@ -111,43 +129,27 @@ async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return await _show_signature_options(update, context)
 
 
-async def _store_single_message(
-    msg: Message, user, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Extract and store message info in user_data."""
+async def _store_single_message(msg: Message, user, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = extract_text(msg)
-
     if msg.photo:
-        ctype = "photo"
-        file_id = msg.photo[-1].file_id
+        ctype, file_id = "photo", msg.photo[-1].file_id
         data = {"file_id": file_id, "text": text}
     elif msg.video:
-        ctype = "video"
-        file_id = msg.video.file_id
+        ctype, file_id = "video", msg.video.file_id
         data = {"file_id": file_id, "text": text}
     elif msg.document:
-        ctype = "document"
-        file_id = msg.document.file_id
+        ctype, file_id = "document", msg.document.file_id
         data = {"file_id": file_id, "text": text}
     elif msg.audio:
-        ctype = "audio"
-        file_id = msg.audio.file_id
+        ctype, file_id = "audio", msg.audio.file_id
         data = {"file_id": file_id, "text": text}
     else:
         ctype = "text"
         data = {"text": text}
-
-    context.user_data["submission"] = {
-        "content_type": ctype,
-        "message_data": data,
-        "raw_text": text,
-    }
+    context.user_data["submission"] = {"content_type": ctype, "message_data": data, "raw_text": text}
 
 
-async def _collect_media_group(
-    msg: Message, user, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Aggregate MediaGroup then move to signature selection."""
+async def _collect_media_group(msg: Message, user, context: ContextTypes.DEFAULT_TYPE) -> int:
     gid = msg.media_group_id
     _pending_groups[gid].append(msg)
 
@@ -158,12 +160,10 @@ async def _collect_media_group(
         _pending_tasks[gid].cancel()
 
     async def _flush():
-        # Always set the event even if an exception occurs, to unblock the waiter
         try:
             await asyncio.sleep(config.MEDIA_GROUP_DELAY)
             messages = _pending_groups.pop(gid, [])
             messages.sort(key=lambda m: m.message_id)
-
             items = []
             caption = ""
             for i, m in enumerate(messages):
@@ -175,14 +175,12 @@ async def _collect_media_group(
                     items.append({"type": "video", "file_id": m.video.file_id})
                 elif m.document:
                     items.append({"type": "document", "file_id": m.document.file_id})
-
             context.user_data["submission"] = {
                 "content_type": "album",
                 "message_data": {"items": items, "text": caption},
                 "raw_text": caption,
             }
         finally:
-            # Always unblock the waiter — even on error
             event = _group_resolved.get(gid)
             if event:
                 event.set()
@@ -190,7 +188,6 @@ async def _collect_media_group(
     task = asyncio.get_event_loop().create_task(_flush())
     _pending_tasks[gid] = task
 
-    # Wait for aggregation — hold a reference before the task can pop it
     event = _group_resolved.get(gid)
     if event:
         await event.wait()
@@ -200,33 +197,26 @@ async def _collect_media_group(
 
 # ── Signature selection ───────────────────────────────────────────────────────
 
-async def _show_signature_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = InlineKeyboardMarkup([
+def _signature_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🕵️ 匿名投稿", callback_data="sign:anonymous")],
         [InlineKeyboardButton("👤 展示用户名", callback_data="sign:username")],
         [InlineKeyboardButton("✏️ 自定义署名", callback_data="sign:custom")],
         [InlineKeyboardButton("❌ 取消", callback_data="sign:cancel")],
     ])
-    await update.effective_message.reply_text(
-        "📝 请选择您的署名方式：", reply_markup=keyboard
-    )
+
+
+async def _show_signature_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.effective_message.reply_text("📝 请选择您的署名方式：", reply_markup=_signature_keyboard())
     return WAITING_SIGNATURE
 
 
 async def _show_signature_options_raw(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🕵️ 匿名投稿", callback_data="sign:anonymous")],
-        [InlineKeyboardButton("👤 展示用户名", callback_data="sign:username")],
-        [InlineKeyboardButton("✏️ 自定义署名", callback_data="sign:custom")],
-        [InlineKeyboardButton("❌ 取消", callback_data="sign:cancel")],
-    ])
-    await msg.reply_text("📝 请选择您的署名方式：", reply_markup=keyboard)
+    await msg.reply_text("📝 请选择您的署名方式：", reply_markup=_signature_keyboard())
     return WAITING_SIGNATURE
 
 
-async def handle_signature_choice(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
+async def handle_signature_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":")[1]
@@ -241,19 +231,36 @@ async def handle_signature_choice(
         if not user.username:
             await query.edit_message_text(
                 "⚠️ 您尚未设置 Telegram 用户名。\n"
-                "请前往 Telegram 设置添加用户名后重新投稿，或选择其他署名方式。"
+                "请前往设置添加用户名后重新投稿，或选择其他署名方式。",
+                reply_markup=_signature_keyboard(),
             )
             return WAITING_SIGNATURE
 
     context.user_data["sign_type"] = choice
 
     if choice == "custom":
-        await query.edit_message_text(
-            "✏️ 请输入您想展示的自定义署名（20 字以内）："
-        )
+        # Always set sign_type BEFORE the edit, so if edit fails state still transitions correctly
+        try:
+            await query.edit_message_text("✏️ 请输入您想展示的自定义署名（20 字以内）：")
+        except Exception:
+            await query.message.reply_text("✏️ 请输入您想展示的自定义署名（20 字以内）：")
         return WAITING_CUSTOM_NAME
 
     return await _show_preview(query, context, update)
+
+
+async def _handle_text_in_signature_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Bug 1 fix: user typed text while in WAITING_SIGNATURE.
+    If sign_type is 'custom' (edit message may have failed), treat text as custom name.
+    Otherwise re-show the keyboard.
+    """
+    if context.user_data.get("sign_type") == "custom":
+        return await handle_custom_name(update, context)
+    await update.effective_message.reply_text(
+        "👆 请点击上方按钮选择署名方式：", reply_markup=_signature_keyboard()
+    )
+    return WAITING_SIGNATURE
 
 
 async def handle_custom_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -266,10 +273,11 @@ async def handle_custom_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return WAITING_CUSTOM_NAME
 
     context.user_data["custom_name"] = name
+    context.user_data["sign_type"] = "custom"
     return await _show_preview(update.effective_message, context, update)
 
 
-# ── Preview ───────────────────────────────────────────────────────────────────
+# ── Preview (sends actual media file) ────────────────────────────────────────
 
 async def _show_preview(target, context: ContextTypes.DEFAULT_TYPE, update) -> int:
     sub = context.user_data.get("submission", {})
@@ -284,21 +292,20 @@ async def _show_preview(target, context: ContextTypes.DEFAULT_TYPE, update) -> i
     }
     sign_label = sign_labels.get(sign_type, "匿名")
 
-    content_preview = sub.get("message_data", {}).get("text", "") or "[媒体文件]"
-    if len(content_preview) > 200:
-        content_preview = content_preview[:200] + "…"
-
+    ctype = sub.get("content_type", "text")
+    data = sub.get("message_data", {})
+    raw_text = data.get("text", "")
     ctype_label = {"text": "文字", "photo": "图片", "video": "视频",
-                   "document": "文件", "album": "相册", "audio": "音频"}.get(
-        sub.get("content_type", "text"), "内容"
-    )
+                   "document": "文件", "album": "相册", "audio": "音频"}.get(ctype, "内容")
 
-    text = (
+    caption = (
         f"📋 <b>请确认您的投稿内容：</b>\n\n"
         f"<b>署名方式：</b>{sign_label}\n"
         f"<b>内容类型：</b>{ctype_label}\n"
-        f"<b>内容预览：</b>\n{content_preview}"
     )
+    if raw_text:
+        preview = raw_text[:200] + ("…" if len(raw_text) > 200 else "")
+        caption += f"<b>文字内容：</b>\n{preview}"
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -308,10 +315,34 @@ async def _show_preview(target, context: ContextTypes.DEFAULT_TYPE, update) -> i
         ]
     ])
 
-    if hasattr(target, "edit_message_text"):
-        await target.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
-    else:
-        await target.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+    chat_id = update.effective_chat.id
+    bot = context.bot
+
+    try:
+        if ctype == "photo" and data.get("file_id"):
+            await bot.send_photo(chat_id=chat_id, photo=data["file_id"],
+                                  caption=caption, parse_mode="HTML", reply_markup=keyboard)
+        elif ctype == "video" and data.get("file_id"):
+            await bot.send_video(chat_id=chat_id, video=data["file_id"],
+                                  caption=caption, parse_mode="HTML", reply_markup=keyboard)
+        elif ctype == "document" and data.get("file_id"):
+            await bot.send_document(chat_id=chat_id, document=data["file_id"],
+                                     caption=caption, parse_mode="HTML", reply_markup=keyboard)
+        elif ctype == "audio" and data.get("file_id"):
+            await bot.send_audio(chat_id=chat_id, audio=data["file_id"],
+                                  caption=caption, parse_mode="HTML", reply_markup=keyboard)
+        elif ctype == "album":
+            items = data.get("items", [])
+            album_caption = caption + f"\n共 {len(items)} 个媒体文件"
+            await bot.send_message(chat_id=chat_id, text=album_caption,
+                                    parse_mode="HTML", reply_markup=keyboard)
+        else:
+            await bot.send_message(chat_id=chat_id, text=caption,
+                                    parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        logger.warning("Preview send failed (%s), fallback to text: %s", ctype, e)
+        await bot.send_message(chat_id=chat_id, text=caption,
+                                parse_mode="HTML", reply_markup=keyboard)
 
     return CONFIRMING
 
@@ -322,29 +353,22 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     action = query.data.split(":")[1]
 
     if action == "cancel":
-        await query.edit_message_text("❌ 已取消投稿。")
+        try:
+            await query.edit_message_text("❌ 已取消投稿。")
+        except Exception:
+            await query.message.reply_text("❌ 已取消投稿。")
         context.user_data.clear()
         return ConversationHandler.END
 
     if action == "reedit":
-        sub = context.user_data.get("submission", {})
-        ctype = sub.get("content_type", "text")
-        ctype_label = {"text": "文字", "photo": "图片", "video": "视频",
-                       "document": "文件", "album": "相册", "audio": "音频"}.get(ctype, "内容")
-        original_text = sub.get("message_data", {}).get("text", "") or ""
-        if original_text:
-            preview = original_text[:300] + ("…" if len(original_text) > 300 else "")
-            prompt = (
-                f"✏️ 请重新发送您的投稿内容：\n\n"
-                f"<b>原内容（{ctype_label}）：</b>\n{preview}"
-            )
-        else:
-            prompt = f"✏️ 请重新发送您的投稿内容（原内容为 {ctype_label}，无文字）："
-        await query.edit_message_text(prompt, parse_mode="HTML")
         context.user_data.pop("submission", None)
+        try:
+            await query.edit_message_text("✏️ 请重新发送您的投稿内容（文字、图片、视频、文件或相册）：")
+        except Exception:
+            await query.message.reply_text("✏️ 请重新发送您的投稿内容（文字、图片、视频、文件或相册）：")
         return WAITING_CONTENT
 
-    # Confirm — write to DB and notify admins
+    # Confirm
     user = update.effective_user
     sub = context.user_data.get("submission", {})
     sign_type = context.user_data.get("sign_type", "anonymous")
@@ -352,7 +376,6 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     raw_text = sub.get("raw_text", "")
     filtered_text = await filter_text(raw_text)
-    # Apply filter back to message_data
     if "text" in sub.get("message_data", {}):
         sub["message_data"]["text"] = filtered_text
 
@@ -365,37 +388,34 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         message_data=sub.get("message_data", {}),
     )
 
-    await query.edit_message_text(
-        "✅ 投稿已提交，正在等待审核，结果将通过私信通知您。\n感谢您的投稿！"
-    )
+    try:
+        await query.edit_message_text(
+            "✅ 投稿已提交，正在等待审核，结果将通过私信通知您。\n感谢您的投稿！"
+        )
+    except Exception:
+        await query.message.reply_text(
+            "✅ 投稿已提交，正在等待审核，结果将通过私信通知您。\n感谢您的投稿！"
+        )
 
-    # Notify admins
     await _notify_admins(context.bot, submission_id, user, sub, sign_type)
-
     context.user_data.clear()
     return ConversationHandler.END
 
 
-# ── Admin notification ────────────────────────────────────────────────────────
+# ── Admin notification (with actual media) ────────────────────────────────────
 
-async def _notify_admins(
-    bot: Bot,
-    submission_id: int,
-    user,
-    sub: dict,
-    sign_type: str,
-) -> None:
+async def _notify_admins(bot: Bot, submission_id: int, user, sub: dict, sign_type: str) -> None:
     sign_labels = {
         "anonymous": "🕵️ 匿名投稿",
         "username": f"👤 展示用户名 (@{user.username or '无'})",
-        "custom": f"✏️ 自定义署名",
+        "custom": "✏️ 自定义署名",
     }
     sign_label = sign_labels.get(sign_type, "匿名")
+    ctype = sub.get("content_type", "text")
     ctype_label = {"text": "文字", "photo": "图片", "video": "视频",
-                   "document": "文件", "album": "相册", "audio": "音频"}.get(
-        sub.get("content_type", "text"), "内容"
-    )
-    content_preview = sub.get("message_data", {}).get("text", "") or "[媒体文件]"
+                   "document": "文件", "album": "相册", "audio": "音频"}.get(ctype, "内容")
+    data = sub.get("message_data", {})
+    content_preview = data.get("text", "") or "[媒体文件]"
     if len(content_preview) > 300:
         content_preview = content_preview[:300] + "…"
 
@@ -419,9 +439,7 @@ async def _notify_admins(
         ]
     ])
 
-    # Determine where to send: review group or all admins' DMs
     import config as _cfg
-
     targets = []
     if _cfg.REVIEW_GROUP_ID:
         targets.append(_cfg.REVIEW_GROUP_ID)
@@ -431,12 +449,37 @@ async def _notify_admins(
 
     for chat_id in targets:
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
+            # 1. Send review notification with action buttons
+            await bot.send_message(chat_id=chat_id, text=text,
+                                    parse_mode="HTML", reply_markup=keyboard)
+            # 2. Send the actual media so admin can see the real content
+            file_id = data.get("file_id")
+            media_caption = data.get("text", "") or None
+            if ctype == "photo" and file_id:
+                await bot.send_photo(chat_id=chat_id, photo=file_id, caption=media_caption)
+            elif ctype == "video" and file_id:
+                await bot.send_video(chat_id=chat_id, video=file_id, caption=media_caption)
+            elif ctype == "document" and file_id:
+                await bot.send_document(chat_id=chat_id, document=file_id, caption=media_caption)
+            elif ctype == "audio" and file_id:
+                await bot.send_audio(chat_id=chat_id, audio=file_id, caption=media_caption)
+            elif ctype == "album":
+                items = data.get("items", [])
+                if items:
+                    media_group = []
+                    for i, item in enumerate(items[:10]):
+                        cap = media_caption if i == 0 else None
+                        fid = item.get("file_id")
+                        if not fid:
+                            continue
+                        if item["type"] == "photo":
+                            media_group.append(InputMediaPhoto(media=fid, caption=cap))
+                        elif item["type"] == "video":
+                            media_group.append(InputMediaVideo(media=fid, caption=cap))
+                        elif item["type"] == "document":
+                            media_group.append(InputMediaDocument(media=fid, caption=cap))
+                    if media_group:
+                        await bot.send_media_group(chat_id=chat_id, media=media_group)
         except Exception as e:
             logger.error("Failed to notify admin %s: %s", chat_id, e)
 
@@ -452,25 +495,20 @@ async def cancel_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ── ConversationHandler factory ───────────────────────────────────────────────
 
 def build_submission_conversation() -> ConversationHandler:
-    """Return the fully-configured ConversationHandler for user submissions."""
     return ConversationHandler(
         entry_points=[
             CommandHandler("start", cmd_start),
-            # Non-admin private message triggers content submission
-            MessageHandler(
-                filters.ChatType.PRIVATE & ~filters.COMMAND,
-                receive_content,
-            ),
+            MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, receive_content),
         ],
         states={
             WAITING_CONTENT: [
-                MessageHandler(
-                    filters.ChatType.PRIVATE & ~filters.COMMAND,
-                    receive_content,
-                )
+                CallbackQueryHandler(handle_user_action, pattern=r"^user_action:"),
+                MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, receive_content),
             ],
             WAITING_SIGNATURE: [
-                CallbackQueryHandler(handle_signature_choice, pattern=r"^sign:")
+                CallbackQueryHandler(handle_signature_choice, pattern=r"^sign:"),
+                # Bug 1 fix: handle text typed in this state instead of re-entering
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_text_in_signature_state),
             ],
             WAITING_CUSTOM_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_name)

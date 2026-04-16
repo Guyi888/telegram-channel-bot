@@ -227,20 +227,52 @@ async def list_admins() -> List[Dict]:
 # ============================================================
 
 async def get_target_channel() -> Optional[str]:
+    """Return primary target channel id (string), or None."""
     async with aiosqlite.connect(_DB_PATH) as conn:
         cur = await conn.execute(
-            "SELECT channel_id FROM channels WHERE type='target' ORDER BY id DESC LIMIT 1")
+            "SELECT channel_id FROM channels WHERE type='target' ORDER BY id ASC LIMIT 1")
         row = await cur.fetchone()
         return str(row[0]) if row else None
 
 
+async def get_all_target_channels() -> List[Dict]:
+    """Return all configured target channels."""
+    async with aiosqlite.connect(_DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM channels WHERE type='target' ORDER BY id ASC")
+        return [dict(r) for r in await cur.fetchall()]
+
+
 async def set_target_channel(channel_id: int, channel_name: str) -> None:
+    """Legacy: replace single target channel (kept for compatibility)."""
     async with aiosqlite.connect(_DB_PATH) as conn:
         await conn.execute("DELETE FROM channels WHERE type='target'")
         await conn.execute(
             "INSERT INTO channels(type,channel_id,channel_name) VALUES('target',?,?)",
             (channel_id, channel_name))
         await conn.commit()
+
+
+async def add_target_channel(channel_id: int, channel_name: str) -> bool:
+    """Add a target channel without removing existing ones."""
+    try:
+        async with aiosqlite.connect(_DB_PATH) as conn:
+            await conn.execute(
+                "INSERT OR IGNORE INTO channels(type,channel_id,channel_name) VALUES('target',?,?)",
+                (channel_id, channel_name))
+            await conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+async def remove_target_channel(channel_id: int) -> bool:
+    async with aiosqlite.connect(_DB_PATH) as conn:
+        cur = await conn.execute(
+            "DELETE FROM channels WHERE type='target' AND channel_id=?", (channel_id,))
+        await conn.commit()
+        return cur.rowcount > 0
 
 
 async def get_source_channels() -> List[Dict]:
@@ -472,9 +504,9 @@ async def toggle_reaction(
                 "DELETE FROM reactions WHERE message_id=? AND user_id=?",
                 (message_id, user_id))
         elif existing:
-            # Switch reaction
+            # Switch reaction — also update created_at so daily stats are accurate
             await conn.execute(
-                "UPDATE reactions SET type=? WHERE message_id=? AND user_id=?",
+                "UPDATE reactions SET type=?, created_at=CURRENT_TIMESTAMP WHERE message_id=? AND user_id=?",
                 (reaction_type, message_id, user_id))
         else:
             # New reaction

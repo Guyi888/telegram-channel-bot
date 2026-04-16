@@ -61,7 +61,10 @@ async def post_init(application: Application) -> None:
     # 3. Set bot command menu
     await application.bot.set_my_commands([
         BotCommand("start",           "开始 / 投稿"),
+        BotCommand("panel",           "管理员操作面板"),
         BotCommand("status",          "查看机器人状态"),
+        BotCommand("addtarget",       "添加目标频道（超级管理员）"),
+        BotCommand("deltarget",       "删除目标频道（超级管理员）"),
         BotCommand("setchannel",      "设置目标频道（超级管理员）"),
         BotCommand("addsource",       "添加来源频道（超级管理员）"),
         BotCommand("delsource",       "删除来源频道（超级管理员）"),

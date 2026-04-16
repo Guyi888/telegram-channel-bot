@@ -123,8 +123,47 @@ class ChannelCollector:
         self._monitored = {s["channel_id"] for s in sources}
         logger.info("Monitoring %s source channels.", len(self._monitored))
 
+        # Auto-join all monitored channels so Pyrogram receives their updates
+        for src in sources:
+            cid = src["channel_id"]
+            try:
+                await self._client.join_chat(cid)
+                logger.info("Joined source channel %s", cid)
+            except Exception as e:
+                # Already a member, or cannot join (private, etc.) — non-fatal
+                logger.debug("join_chat(%s) skipped: %s", cid, e)
+
+    async def join_channel(self, channel_id: int) -> bool:
+        """
+        Join a channel so Pyrogram receives its messages.
+        Called by management handler after a new source channel is added.
+        Returns True on success.
+        """
+        if not self._client or not self._running:
+            logger.warning("Collector not running — cannot join channel %s", channel_id)
+            return False
+        try:
+            await self._client.join_chat(channel_id)
+            self._monitored.add(channel_id)
+            logger.info("Joined and now monitoring channel %s", channel_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to join channel %s: %s", channel_id, e)
+            return False
+
+    async def leave_channel(self, channel_id: int) -> None:
+        """Leave a source channel when it is removed from monitoring."""
+        self._monitored.discard(channel_id)
+        if not self._client or not self._running:
+            return
+        try:
+            await self._client.leave_chat(channel_id)
+            logger.info("Left channel %s", channel_id)
+        except Exception as e:
+            logger.debug("leave_chat(%s) skipped: %s", channel_id, e)
+
     def refresh_sources_sync(self, channel_ids: List[int]) -> None:
-        """Called by management handler when source list changes."""
+        """Called by management handler when source list changes (sync version)."""
         self._monitored = set(channel_ids)
 
     # ── Message handler ───────────────────────────────────────────────────────

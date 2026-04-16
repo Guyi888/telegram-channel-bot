@@ -319,6 +319,42 @@ async def handle_review_edit_start(
     context.user_data["edit_submission_id"] = submission_id
     context.user_data["edit_original"] = submission
 
+    # Show original submission media so admin can see what they're editing
+    data = submission.get("message_data", {})
+    ctype = submission.get("content_type", data.get("content_type", "text"))
+    caption = data.get("text", "")
+    file_id = data.get("file_id")
+    chat_id = query.message.chat_id
+
+    preview_sent = False
+    if file_id:
+        try:
+            if ctype == "photo":
+                await context.bot.send_photo(chat_id=chat_id, photo=file_id,
+                    caption=f"📎 原始投稿内容：\n{caption}" if caption else "📎 原始投稿内容：")
+                preview_sent = True
+            elif ctype == "video":
+                await context.bot.send_video(chat_id=chat_id, video=file_id,
+                    caption=f"📎 原始投稿内容：\n{caption}" if caption else "📎 原始投稿内容：")
+                preview_sent = True
+            elif ctype == "document":
+                await context.bot.send_document(chat_id=chat_id, document=file_id,
+                    caption=f"📎 原始投稿内容：\n{caption}" if caption else "📎 原始投稿内容：")
+                preview_sent = True
+            elif ctype == "audio":
+                await context.bot.send_audio(chat_id=chat_id, audio=file_id,
+                    caption=f"📎 原始投稿内容：\n{caption}" if caption else "📎 原始投稿内容：")
+                preview_sent = True
+            elif ctype == "animation":
+                await context.bot.send_animation(chat_id=chat_id, animation=file_id,
+                    caption=f"📎 原始投稿内容：\n{caption}" if caption else "📎 原始投稿内容：")
+                preview_sent = True
+        except Exception as e:
+            logger.warning("Could not resend submission media for editing: %s", e)
+
+    if not preview_sent and caption:
+        await query.message.reply_text(f"📎 原始投稿内容：\n{caption}")
+
     # reply_text keeps the original review notice above; edit_message_text would destroy it
     await query.message.reply_text(
         "✏️ 请发送修改后的投稿内容（文字 / 图片 / 视频 / 文件）：\n"
