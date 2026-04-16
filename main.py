@@ -81,6 +81,7 @@ async def post_init(application: Application) -> None:
         BotCommand("submissionlimit", "设置每日投稿上限（超级管理员）"),
         BotCommand("ban",             "封禁用户投稿"),
         BotCommand("unban",           "解封用户投稿"),
+        BotCommand("adfilter",        "广告过滤设置（超级管理员）"),
         BotCommand("logs",            "查看操作日志（超级管理员）"),
         BotCommand("cancel",          "取消当前操作"),
     ])

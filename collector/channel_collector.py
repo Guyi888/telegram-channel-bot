@@ -19,12 +19,81 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import List, Optional, Set
 
 import config
 from database import db
 
 logger = logging.getLogger(__name__)
+
+# ── Ad / spam filter ──────────────────────────────────────────────────────────
+
+# Regex patterns that strongly indicate advertisement content
+_AD_URL_RE = re.compile(
+    r'https?://\S+|t\.me/\S+|telegram\.me/\S+',
+    re.IGNORECASE,
+)
+_AD_USERNAME_RE = re.compile(
+    r'@[a-zA-Z][a-zA-Z0-9_]{3,}',  # @username with 5+ total chars
+)
+
+
+async def _is_ad_message(message) -> bool:
+    """
+    Return True if the message should be filtered out as an advertisement.
+
+    Checks (in order):
+      1. Filter is disabled in DB config → always pass through
+      2. Pyrogram message entities: URL, TextLink, Mention → reject
+      3. Regex fallback on text/caption → reject if URL or @username found
+      4. Custom keyword list stored in DB config → reject if any match
+    """
+    # 1. Check if filter is enabled
+    enabled = await db.get_config("ad_filter_enabled", "1")
+    if enabled != "1":
+        return False
+
+    text = message.text or message.caption or ""
+
+    # 2. Check Pyrogram entities (most reliable)
+    entities = getattr(message, "entities", None) or \
+               getattr(message, "caption_entities", None) or []
+
+    if PYROGRAM_AVAILABLE:
+        try:
+            from pyrogram.enums import MessageEntityType
+            for ent in entities:
+                if ent.type in (
+                    MessageEntityType.URL,
+                    MessageEntityType.TEXT_LINK,
+                    MessageEntityType.MENTION,
+                ):
+                    logger.info("Ad filter: entity %s found in msg %s", ent.type, message.id)
+                    return True
+        except Exception:
+            pass  # fallback to regex below
+
+    # 3. Regex fallback
+    if text:
+        if _AD_URL_RE.search(text):
+            logger.info("Ad filter: URL pattern found in msg %s", message.id)
+            return True
+        if _AD_USERNAME_RE.search(text):
+            logger.info("Ad filter: @username pattern found in msg %s", message.id)
+            return True
+
+    # 4. Custom keywords
+    kw_raw = await db.get_config("ad_filter_keywords", "")
+    if kw_raw and text:
+        keywords = [k.strip() for k in kw_raw.split(",") if k.strip()]
+        text_lower = text.lower()
+        for kw in keywords:
+            if kw.lower() in text_lower:
+                logger.info("Ad filter: keyword '%s' found in msg %s", kw, message.id)
+                return True
+
+    return False
 
 # Pyrogram may not be installed in every deployment — import lazily so the bot
 # still starts even when the collector is not configured.
@@ -184,6 +253,11 @@ class ChannelCollector:
 
         # Only process messages from monitored channels
         if chat_id not in self._monitored:
+            return
+
+        # Ad / spam filter
+        if await _is_ad_message(message):
+            logger.info("Dropped ad message %s from channel %s", message.id, chat_id)
             return
 
         # Serialise message to a dict for the queue

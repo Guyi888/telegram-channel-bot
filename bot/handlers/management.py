@@ -821,6 +821,93 @@ async def handle_cn_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
 
 
+# ── /adfilter — Ad filter management ─────────────────────────────────────────
+
+@super_only
+async def cmd_adfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /adfilter          — show current ad filter status
+    /adfilter on       — enable filter
+    /adfilter off      — disable filter
+    /adfilter addkw 词 — add custom keyword
+    /adfilter delkw 词 — remove custom keyword
+    /adfilter list     — list custom keywords
+    """
+    args = context.args or []
+    sub = args[0].lower() if args else ""
+
+    if sub == "on":
+        await db.set_config("ad_filter_enabled", "1")
+        await db.log_action(update.effective_user.id, "ad_filter_toggle", "on")
+        await update.message.reply_text("✅ 广告过滤已<b>开启</b>（含链接/用户名的消息将被丢弃）", parse_mode="HTML")
+
+    elif sub == "off":
+        await db.set_config("ad_filter_enabled", "0")
+        await db.log_action(update.effective_user.id, "ad_filter_toggle", "off")
+        await update.message.reply_text("⛔ 广告过滤已<b>关闭</b>，所有消息都会转发", parse_mode="HTML")
+
+    elif sub == "addkw":
+        kw = args[1] if len(args) > 1 else ""
+        if not kw:
+            await update.message.reply_text("用法：/adfilter addkw 关键词")
+            return
+        raw = await db.get_config("ad_filter_keywords", "")
+        existing = [k.strip() for k in raw.split(",") if k.strip()]
+        if kw in existing:
+            await update.message.reply_text(f"⚠️ 关键词「{kw}」已存在")
+            return
+        existing.append(kw)
+        await db.set_config("ad_filter_keywords", ",".join(existing))
+        await update.message.reply_text(f"✅ 已添加过滤关键词：{kw}\n当前共 {len(existing)} 个")
+
+    elif sub == "delkw":
+        kw = args[1] if len(args) > 1 else ""
+        if not kw:
+            await update.message.reply_text("用法：/adfilter delkw 关键词")
+            return
+        raw = await db.get_config("ad_filter_keywords", "")
+        existing = [k.strip() for k in raw.split(",") if k.strip()]
+        if kw not in existing:
+            await update.message.reply_text(f"⚠️ 关键词「{kw}」不存在")
+            return
+        existing.remove(kw)
+        await db.set_config("ad_filter_keywords", ",".join(existing))
+        await update.message.reply_text(f"✅ 已删除过滤关键词：{kw}")
+
+    elif sub == "list":
+        raw = await db.get_config("ad_filter_keywords", "")
+        keywords = [k.strip() for k in raw.split(",") if k.strip()]
+        if keywords:
+            kw_text = "\n".join(f"  • {k}" for k in keywords)
+            await update.message.reply_text(f"📋 自定义过滤关键词（{len(keywords)} 个）：\n{kw_text}")
+        else:
+            await update.message.reply_text("📋 暂无自定义过滤关键词")
+
+    else:
+        # Show status
+        enabled = await db.get_config("ad_filter_enabled", "1")
+        raw = await db.get_config("ad_filter_keywords", "")
+        keywords = [k.strip() for k in raw.split(",") if k.strip()]
+        status = "🟢 开启" if enabled == "1" else "🔴 关闭"
+        kw_text = "、".join(keywords) if keywords else "（无）"
+        await update.message.reply_text(
+            f"<b>📵 广告过滤设置</b>\n\n"
+            f"状态：{status}\n"
+            f"自动过滤规则：\n"
+            f"  • 含 http/https 链接\n"
+            f"  • 含 t.me/ 链接\n"
+            f"  • 含 @用户名\n"
+            f"自定义关键词：{kw_text}\n\n"
+            f"<b>命令：</b>\n"
+            f"/adfilter on — 开启\n"
+            f"/adfilter off — 关闭\n"
+            f"/adfilter addkw 词 — 添加关键词\n"
+            f"/adfilter delkw 词 — 删除关键词\n"
+            f"/adfilter list — 查看关键词",
+            parse_mode="HTML",
+        )
+
+
 # ── Register all handlers ─────────────────────────────────────────────────────
 
 def register_management_handlers(app) -> None:
@@ -850,6 +937,7 @@ def register_management_handlers(app) -> None:
         ("logs",            cmd_logs),
         ("status",          cmd_status),
         ("panel",           cmd_panel),
+        ("adfilter",        cmd_adfilter),
     ]
     for cmd, handler in cmds:
         app.add_handler(CommandHandler(cmd, handler))
