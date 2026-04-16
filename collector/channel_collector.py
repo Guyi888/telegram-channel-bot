@@ -61,7 +61,7 @@ class ChannelCollector:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Create and start the Pyrogram client, then register message handlers."""
+        """Create Pyrogram client, register handlers BEFORE start(), then connect."""
         if not config.API_ID or not config.API_HASH or not config.PHONE_NUMBER:
             logger.warning("Pyrogram credentials not configured — collector not started.")
             return
@@ -73,6 +73,19 @@ class ChannelCollector:
             phone_number=config.PHONE_NUMBER,
         )
 
+        # ── Register handlers BEFORE start() — required by Pyrogram v2 ──────────
+        # Use filters.channel to capture channel posts specifically.
+        # Also capture edited channel posts so updates are not missed.
+        @self._client.on_message(filters.channel)
+        async def _on_channel_post(client, message):
+            await self._handle_message(message)
+
+        @self._client.on_edited_message(filters.channel)
+        async def _on_edited_channel_post(client, message):
+            # Treat edits same as new posts so content is not missed
+            await self._handle_message(message)
+
+        logger.info("Channel message handlers registered.")
         await self._start_with_retry()
 
     async def _start_with_retry(self) -> None:
@@ -83,15 +96,10 @@ class ChannelCollector:
                 self._retry_count = 0
                 logger.info("Pyrogram collector started successfully.")
 
-                # Refresh monitored channel set from DB
+                # Refresh monitored channel set from DB and auto-join channels
                 await self._refresh_sources()
 
-                # Register the message handler
-                @self._client.on_message()
-                async def _on_message(client, message):
-                    await self._handle_message(message)
-
-                # Keep running
+                # Keep running indefinitely
                 await asyncio.Event().wait()
 
             except FloodWait as e:
@@ -131,7 +139,7 @@ class ChannelCollector:
                 logger.info("Joined source channel %s", cid)
             except Exception as e:
                 # Already a member, or cannot join (private, etc.) — non-fatal
-                logger.debug("join_chat(%s) skipped: %s", cid, e)
+                logger.warning("join_chat(%s) skipped: %s", cid, e)
 
     async def join_channel(self, channel_id: int) -> bool:
         """
@@ -169,16 +177,20 @@ class ChannelCollector:
     # ── Message handler ───────────────────────────────────────────────────────
 
     async def _handle_message(self, message) -> None:
-        """Called for every message the personal account receives."""
-        # Only process messages from monitored channels
+        """Called for every channel post the personal account receives."""
         chat_id = getattr(message.chat, "id", None)
+        logger.info("Received channel message: chat_id=%s monitored=%s",
+                    chat_id, chat_id in self._monitored)
+
+        # Only process messages from monitored channels
         if chat_id not in self._monitored:
             return
 
         # Serialise message to a dict for the queue
         data = await self._serialize_message(message)
         await db.enqueue_message(chat_id, data)
-        logger.debug("Queued message %s from channel %s", message.id, chat_id)
+        logger.info("Queued message %s from channel %s (type=%s)",
+                    message.id, chat_id, data.get("content_type"))
 
     async def _serialize_message(self, message) -> dict:
         """Convert a Pyrogram Message to a JSON-serialisable dict."""
