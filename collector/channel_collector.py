@@ -193,32 +193,21 @@ class ChannelCollector:
                     message.id, chat_id, data.get("content_type"))
 
     async def _serialize_message(self, message) -> dict:
-        """Convert a Pyrogram Message to a JSON-serialisable dict."""
-        data: dict = {
-            "message_id": message.id,
+        """
+        Store only the source channel ID and message ID.
+
+        Pyrogram file_ids are MTProto-layer IDs that are NOT compatible with
+        the Bot API.  Instead of trying to pass file_ids across the boundary,
+        we store the original message coordinates and use Bot API
+        copy_message() in the queue consumer to copy the content.
+        """
+        return {
             "source_channel_id": message.chat.id,
+            "source_message_id": message.id,
             "media_group_id": message.media_group_id,
             "text": message.text or message.caption or "",
-            "content_type": "text",
+            "content_type": "channel_message",  # consumed by copy_message path
         }
-
-        if message.photo:
-            data["content_type"] = "photo"
-            data["file_id"] = message.photo.file_id
-        elif message.video:
-            data["content_type"] = "video"
-            data["file_id"] = message.video.file_id
-        elif message.document:
-            data["content_type"] = "document"
-            data["file_id"] = message.document.file_id
-        elif message.audio:
-            data["content_type"] = "audio"
-            data["file_id"] = message.audio.file_id
-        elif message.animation:
-            data["content_type"] = "animation"
-            data["file_id"] = message.animation.file_id
-
-        return data
 
     # ── Admin alerts ──────────────────────────────────────────────────────────
 
@@ -299,24 +288,70 @@ async def run_queue_consumer(bot) -> None:
         await asyncio.sleep(config.QUEUE_POLL_INTERVAL)
 
 
+async def _copy_and_react(bot, target: str, source_channel_id: int,
+                          source_message_id: int) -> bool:
+    """
+    Copy a single message from a public source channel to the target channel
+    using Bot API copy_message, then attach reaction buttons.
+    Returns True on success.
+    """
+    from telegram.error import RetryAfter, TelegramError
+    from services.publisher import build_reply_markup
+    try:
+        msg = await bot.copy_message(
+            chat_id=target,
+            from_chat_id=source_channel_id,
+            message_id=source_message_id,
+        )
+        logger.info("Copied message %s from %s → %s (new id=%s)",
+                    source_message_id, source_channel_id, target, msg.message_id)
+        # Attach reaction / ad buttons
+        try:
+            markup = await build_reply_markup(msg.message_id)
+            await bot.edit_message_reply_markup(
+                chat_id=target,
+                message_id=msg.message_id,
+                reply_markup=markup,
+            )
+        except Exception as e:
+            logger.debug("Could not add reaction buttons to %s: %s", msg.message_id, e)
+        return True
+    except RetryAfter as e:
+        logger.warning("RetryAfter %ss copying msg %s", e.retry_after, source_message_id)
+        await asyncio.sleep(e.retry_after + 1)
+        return False
+    except TelegramError as e:
+        logger.error("copy_message failed (src=%s msg=%s): %s",
+                     source_channel_id, source_message_id, e)
+        return False
+
+
 async def _publish_queue_item(bot, target, queue_id, data,
                                publish_text, publish_photo,
                                publish_video, publish_document) -> None:
     from telegram.error import RetryAfter
     ctype = data.get("content_type", "text")
-    text = data.get("text", "")
 
     try:
-        if ctype == "text":
-            await publish_text(bot, target, text)
+        if ctype == "channel_message":
+            # New path: use Bot API copy_message (avoids Pyrogram↔BotAPI file_id mismatch)
+            await _copy_and_react(
+                bot, target,
+                data["source_channel_id"],
+                data["source_message_id"],
+            )
+        elif ctype == "text":
+            text = data.get("text", "")
+            if text:
+                await publish_text(bot, target, text)
         elif ctype == "photo":
-            await publish_photo(bot, target, data["file_id"], caption=text)
+            await publish_photo(bot, target, data["file_id"], caption=data.get("text", ""))
         elif ctype == "video":
-            await publish_video(bot, target, data["file_id"], caption=text)
+            await publish_video(bot, target, data["file_id"], caption=data.get("text", ""))
         elif ctype == "document":
-            await publish_document(bot, target, data["file_id"], caption=text)
+            await publish_document(bot, target, data["file_id"], caption=data.get("text", ""))
         else:
-            # Fallback: forward as text if we don't know how to handle
+            text = data.get("text", "")
             if text:
                 await publish_text(bot, target, text)
         await db.mark_queue_processed(queue_id)
@@ -329,26 +364,34 @@ async def _publish_queue_item(bot, target, queue_id, data,
 
 
 async def _flush_group(bot, target, gid, items) -> None:
-    """Publish a buffered MediaGroup album."""
-    from services.publisher import publish_album
+    """
+    Publish a buffered MediaGroup.
+
+    For channel_message items we use copy_message for each message individually.
+    Telegram will group them visually in the target channel if they are sent
+    in rapid succession and share the same media_group_id (when using forwardMessage);
+    with copy_message each arrives as a separate message, which is acceptable.
+    """
     if not items or not target:
         return
 
-    media_list = []
-    caption = ""
-    for i, (queue_id, data) in enumerate(items):
-        if i == 0:
-            caption = data.get("text", "")
-        ctype = data.get("content_type", "photo")
-        file_id = data.get("file_id")
-        if file_id:
-            media_list.append({"type": ctype, "file_id": file_id})
-
-    if media_list:
-        try:
-            await publish_album(bot, target, media_list, caption=caption)
-        except Exception as e:
-            logger.error("Failed to flush media group %s: %s", gid, e)
-
-    for queue_id, _ in items:
+    for queue_id, data in items:
+        if data.get("content_type") == "channel_message":
+            await _copy_and_react(
+                bot, target,
+                data["source_channel_id"],
+                data["source_message_id"],
+            )
+        else:
+            # Legacy path for old-format queue items with file_id
+            from services.publisher import publish_album
+            file_id = data.get("file_id")
+            if file_id:
+                try:
+                    ctype = data.get("content_type", "photo")
+                    await publish_album(bot, target,
+                                        [{"type": ctype, "file_id": file_id}],
+                                        caption=data.get("text", ""))
+                except Exception as e:
+                    logger.error("Failed to flush legacy item in group %s: %s", gid, e)
         await db.mark_queue_processed(queue_id)
