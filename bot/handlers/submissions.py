@@ -102,6 +102,12 @@ async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     msg = update.effective_message
 
+    # Guard: if already have a pending submission, don't treat this message as new content
+    # (this can happen with leftover state from previous interrupted conversations)
+    if context.user_data.get("submission") and context.user_data.get("sign_type") == "custom":
+        # User is likely trying to type their custom name; forward to handle_custom_name
+        return await handle_custom_name(update, context)
+
     if await db.is_blacklisted(user.id):
         logger.info("Blacklisted user %s tried to submit", user.id)
         return ConversationHandler.END
@@ -521,5 +527,5 @@ def build_submission_conversation() -> ConversationHandler:
         per_user=True,
         per_chat=True,
         per_message=False,
-        allow_reentry=True,
+        allow_reentry=False,
     )
