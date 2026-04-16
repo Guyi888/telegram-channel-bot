@@ -200,32 +200,34 @@ class ChannelCollector:
         self._monitored = {s["channel_id"] for s in sources}
         logger.info("Monitoring %s source channels.", len(self._monitored))
 
-        # Auto-join all monitored channels so Pyrogram receives their updates
+        # Auto-join: prefer @username over numeric ID (more reliable in Pyrogram)
         for src in sources:
             cid = src["channel_id"]
+            username = (src.get("username") or "").strip()
+            peer = f"@{username}" if username else cid
             try:
-                await self._client.join_chat(cid)
-                logger.info("Joined source channel %s", cid)
+                await self._client.join_chat(peer)
+                logger.info("Joined source channel %s (%s)", cid, peer)
             except Exception as e:
-                # Already a member, or cannot join (private, etc.) — non-fatal
-                logger.warning("join_chat(%s) skipped: %s", cid, e)
+                logger.warning("join_chat(%s) skipped: %s", peer, e)
 
-    async def join_channel(self, channel_id: int) -> bool:
+    async def join_channel(self, channel_id: int, username: str = "") -> bool:
         """
         Join a channel so Pyrogram receives its messages.
         Called by management handler after a new source channel is added.
-        Returns True on success.
+        Prefers @username over numeric ID.
         """
         if not self._client or not self._running:
             logger.warning("Collector not running — cannot join channel %s", channel_id)
             return False
+        peer = f"@{username}" if username else channel_id
         try:
-            await self._client.join_chat(channel_id)
+            await self._client.join_chat(peer)
             self._monitored.add(channel_id)
-            logger.info("Joined and now monitoring channel %s", channel_id)
+            logger.info("Joined and now monitoring channel %s (%s)", channel_id, peer)
             return True
         except Exception as e:
-            logger.error("Failed to join channel %s: %s", channel_id, e)
+            logger.error("Failed to join channel %s (%s): %s", channel_id, peer, e)
             return False
 
     async def leave_channel(self, channel_id: int) -> None:

@@ -46,6 +46,7 @@ async def init_db(db_path: str) -> None:
                 type         TEXT    NOT NULL,  -- 'target' | 'source'
                 channel_id   INTEGER NOT NULL,
                 channel_name TEXT,
+                username     TEXT,             -- @username for Pyrogram join_chat
                 added_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(type, channel_id)
             );
@@ -283,12 +284,26 @@ async def get_source_channels() -> List[Dict]:
         return [dict(r) for r in await cur.fetchall()]
 
 
-async def add_source_channel(channel_id: int, channel_name: str) -> bool:
+async def add_source_channel(channel_id: int, channel_name: str,
+                              username: str = "") -> bool:
+    """Add a source channel. username (without @) used by Pyrogram join_chat."""
     try:
         async with aiosqlite.connect(_DB_PATH) as conn:
+            # Try migration: add username column if missing
+            try:
+                await conn.execute("ALTER TABLE channels ADD COLUMN username TEXT")
+                await conn.commit()
+            except Exception:
+                pass  # column already exists
             await conn.execute(
-                "INSERT OR IGNORE INTO channels(type,channel_id,channel_name) VALUES('source',?,?)",
-                (channel_id, channel_name))
+                "INSERT OR IGNORE INTO channels(type,channel_id,channel_name,username) "
+                "VALUES('source',?,?,?)",
+                (channel_id, channel_name, username or ""))
+            # Update username if record already exists
+            if username:
+                await conn.execute(
+                    "UPDATE channels SET username=? WHERE type='source' AND channel_id=?",
+                    (username, channel_id))
             await conn.commit()
         return True
     except Exception:

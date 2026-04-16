@@ -329,19 +329,24 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     raw = context.args[0]
     try:
         chat = await context.bot.get_chat(raw)
-        await db.add_source_channel(chat.id, chat.title or raw)
+        # Extract username (strip @ if present, or use from chat object)
+        username = (chat.username or "").lstrip("@")
+        if not username and raw.startswith("@"):
+            username = raw.lstrip("@")
+        await db.add_source_channel(chat.id, chat.title or raw, username=username)
         await db.log_action(update.effective_user.id, "add_source_channel", str(chat.id))
-        # Refresh running collector + auto-join
+        # Refresh running collector + auto-join (uses username if available)
         collector = context.bot_data.get("collector")
         if collector:
             sources = await db.get_source_channels()
             collector.refresh_sources_sync([s["channel_id"] for s in sources])
             try:
-                await collector.join_channel(chat.id)
+                await collector.join_channel(chat.id, username=username)
             except Exception as je:
                 logger.warning("Auto-join %s failed: %s", chat.id, je)
+        uname_str = f" (@{username})" if username else ""
         await update.message.reply_text(
-            f"✅ 已添加来源频道：{escape_html(chat.title or raw)} (<code>{chat.id}</code>)",
+            f"✅ 已添加来源频道：{escape_html(chat.title or raw)}{uname_str} (<code>{chat.id}</code>)",
             parse_mode="HTML",
         )
     except Exception as e:
