@@ -23,6 +23,8 @@ from telegram.ext import (
 from database import db
 from services import publisher
 from services.classifier import classify_text, get_all_category_names
+from services.word_filter import filter_text
+from utils.helpers import escape_html
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,8 @@ async def _do_approve(query, admin, submission_id: int, submission: dict, contex
     # Auto-classify
     raw_text = submission["message_data"].get("text", "")
     category = await classify_text(raw_text)
+    # Strip angle brackets stored in DB (e.g. "<高清无码>" → "高清无码")
+    category_display = category.strip('<>').strip()
 
     # Let admin confirm/change category
     cat_names = await get_all_category_names()
@@ -90,12 +94,12 @@ async def _do_approve(query, admin, submission_id: int, submission: dict, contex
     # When no categories have been created yet, skip the picker and show a simple confirm button
     if not cat_names:
         await query.edit_message_text(
-            f"📋 自动识别分类：<b>#{category}</b>（尚未创建其他分类）",
+            f"📋 自动识别分类：<b>#{escape_html(category_display)}</b>（尚未创建其他分类）",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    f"✅ 确认发布（#{category}）",
-                    callback_data=f"cat_approve:{submission_id}:{category}",
+                    f"✅ 确认发布（#{category_display}）",
+                    callback_data=f"cat_approve:{submission_id}:{category_display}",
                 )
             ]]),
         )
@@ -104,9 +108,10 @@ async def _do_approve(query, admin, submission_id: int, submission: dict, contex
     keyboard_rows = []
     row = []
     for name in cat_names:
+        name_display = name.strip('<>').strip()
         row.append(InlineKeyboardButton(
-            f"{'✅ ' if name == category else ''}#{name}",
-            callback_data=f"cat_approve:{submission_id}:{name}",
+            f"{'✅ ' if name == category else ''}#{name_display}",
+            callback_data=f"cat_approve:{submission_id}:{name_display}",
         ))
         if len(row) == 3:
             keyboard_rows.append(row)
@@ -115,12 +120,13 @@ async def _do_approve(query, admin, submission_id: int, submission: dict, contex
         keyboard_rows.append(row)
     keyboard_rows.append([
         InlineKeyboardButton(
-            f"✅ 确认使用 #{category}", callback_data=f"cat_approve:{submission_id}:{category}"
+            f"✅ 确认使用 #{category_display}",
+            callback_data=f"cat_approve:{submission_id}:{category_display}",
         )
     ])
 
     await query.edit_message_text(
-        f"📋 系统自动识别分类：<b>#{category}</b>（点击其他分类可修改，或直接确认）",
+        f"📋 系统自动识别分类：<b>#{escape_html(category_display)}</b>（点击其他分类可修改，或直接确认）",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard_rows),
     )
@@ -382,7 +388,7 @@ async def handle_admin_edit_content(
         return ConversationHandler.END
 
     from utils.helpers import extract_text as _et
-    text = _et(msg)
+    text = await filter_text(_et(msg))
     if msg.photo:
         data = {"file_id": msg.photo[-1].file_id, "text": text}
         ctype = "photo"

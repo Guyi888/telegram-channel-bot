@@ -1,21 +1,28 @@
 """
-Publisher service — the single place where messages are sent to the target
-channel.
+Publisher service — the single place where messages are sent to the target channel.
 
 Every published message gets:
-  1. Ad buttons (Module 4) — zero or more rows above
-  2. Reaction buttons (Module 5) — one fixed row at the bottom
-  3. Category tag (Module 6) — appended to caption/text as  #类别名
+  1. Ad buttons (Module 4)
+  2. Reaction buttons (Module 5)
+  3. Category tag (Module 6) — appended as #类别名
+  4. Signature — inline in same message caption/text
 
-The returned message_id can be stored in the message_map table.
+Signature format (all inline, HTML):
+  anonymous  → 「匿名投稿」
+  username   → 「<a href="tg://user?id=ID">@username</a>」
+  custom     → 「自定义名（<a href="tg://user?id=ID">@username</a>）」
 """
 from __future__ import annotations
 
 import asyncio
+import html as html_module
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+from telegram import (
+    Bot, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
+)
 from telegram.error import TelegramError, RetryAfter
 
 from database import db
@@ -57,19 +64,23 @@ async def build_reply_markup(
     discussion_url = await db.get_discussion_group()
     ad_rows = await build_ad_rows()
     reaction = _reaction_row(message_id, likes, dislikes, discussion_url)
-
-    keyboard = ad_rows + [reaction]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(ad_rows + [reaction])
 
 
 # ── Core publish helpers ──────────────────────────────────────────────────────
 
-async def _send_with_retry(coro, retries: int = 3):
-    """Wrap a send coroutine with RetryAfter / flood-wait handling."""
+async def _send_with_retry(make_coro, retries: int = 3):
+    """
+    make_coro: zero-argument callable returning a fresh coroutine each call.
+    Provides RetryAfter / flood-wait handling.
+
+    IMPORTANT: always pass a lambda (or other callable), never a bare coroutine
+    object, because coroutines can only be awaited once.
+    """
     last_exc: Exception | None = None
     for attempt in range(retries):
         try:
-            return await coro
+            return await make_coro()
         except RetryAfter as e:
             wait = e.retry_after + 1
             logger.warning("Flood wait %ss — sleeping (attempt %s)", wait, attempt + 1)
@@ -81,15 +92,47 @@ async def _send_with_retry(coro, retries: int = 3):
             if attempt == retries - 1:
                 raise
             await asyncio.sleep(2)
-    # RetryAfter exhausted all attempts — raise last exception
     if last_exc:
         raise last_exc
     return None
 
 
-async def _append_category(text: str | None, category: str) -> str:
-    tag = f"\n\n#{category}" if category else ""
+def _append_category_tag(text: str | None, category: str) -> str:
+    # Strip decorative angle-brackets stored around category names in the DB,
+    # e.g. "<激情乱伦>" → "#激情乱伦" (valid Telegram hashtag, valid HTML).
+    clean = (category or "").strip("<>").strip()
+    tag = f"\n\n#{clean}" if clean else ""
     return (text or "") + tag
+
+
+# ── Signature builder ─────────────────────────────────────────────────────────
+
+def _build_signature(submission: dict) -> str:
+    """
+    Return HTML-formatted inline signature string.
+
+    anonymous → 「匿名投稿」
+    username  → 「<a href="tg://user?id=ID">@username</a>」
+    custom    → 「custom_name（<a href="tg://user?id=ID">@username</a>）」
+    """
+    sign_type = submission.get("sign_type", "anonymous")
+    user_id = submission.get("user_id", 0)
+    username = (submission.get("username") or "").strip()
+    custom_name = (submission.get("custom_name") or "").strip()
+
+    display = f"@{username}" if username else str(user_id)
+    # html.escape the display name so special chars don't break parse_mode=HTML
+    user_link = f'<a href="tg://user?id={user_id}">{html_module.escape(display)}</a>'
+
+    if sign_type == "anonymous":
+        return "「匿名投稿」"
+    elif sign_type == "username":
+        return f"「{user_link}」"
+    elif sign_type == "custom":
+        if custom_name:
+            return f"「{html_module.escape(custom_name)}（{user_link}）」"
+        return f"「{user_link}」"
+    return "「匿名投稿」"
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -101,13 +144,12 @@ async def publish_text(
     parse_mode: str = "HTML",
     category: str | None = None,
 ) -> Optional[int]:
-    """Publish a plain-text message. Returns the new message_id."""
     if not category:
         category = await classify_text(text)
-    final_text = await _append_category(text, category)
+    final_text = _append_category_tag(text, category)
 
     msg = await _send_with_retry(
-        bot.send_message(
+        lambda: bot.send_message(
             chat_id=target_channel,
             text=final_text,
             parse_mode=parse_mode,
@@ -117,11 +159,12 @@ async def publish_text(
         return None
 
     markup = await build_reply_markup(msg.message_id)
-    await bot.edit_message_reply_markup(
-        chat_id=target_channel,
-        message_id=msg.message_id,
-        reply_markup=markup,
-    )
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=target_channel, message_id=msg.message_id, reply_markup=markup
+        )
+    except TelegramError as e:
+        logger.debug("edit_message_reply_markup: %s", e)
     return msg.message_id
 
 
@@ -135,10 +178,10 @@ async def publish_photo(
 ) -> Optional[int]:
     if not category:
         category = await classify_text(caption or "")
-    final_caption = await _append_category(caption, category)
+    final_caption = _append_category_tag(caption, category)
 
     msg = await _send_with_retry(
-        bot.send_photo(
+        lambda: bot.send_photo(
             chat_id=target_channel,
             photo=file_id,
             caption=final_caption,
@@ -149,11 +192,12 @@ async def publish_photo(
         return None
 
     markup = await build_reply_markup(msg.message_id)
-    await bot.edit_message_reply_markup(
-        chat_id=target_channel,
-        message_id=msg.message_id,
-        reply_markup=markup,
-    )
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=target_channel, message_id=msg.message_id, reply_markup=markup
+        )
+    except TelegramError as e:
+        logger.debug("edit_message_reply_markup: %s", e)
     return msg.message_id
 
 
@@ -167,10 +211,10 @@ async def publish_video(
 ) -> Optional[int]:
     if not category:
         category = await classify_text(caption or "")
-    final_caption = await _append_category(caption, category)
+    final_caption = _append_category_tag(caption, category)
 
     msg = await _send_with_retry(
-        bot.send_video(
+        lambda: bot.send_video(
             chat_id=target_channel,
             video=file_id,
             caption=final_caption,
@@ -181,11 +225,12 @@ async def publish_video(
         return None
 
     markup = await build_reply_markup(msg.message_id)
-    await bot.edit_message_reply_markup(
-        chat_id=target_channel,
-        message_id=msg.message_id,
-        reply_markup=markup,
-    )
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=target_channel, message_id=msg.message_id, reply_markup=markup
+        )
+    except TelegramError as e:
+        logger.debug("edit_message_reply_markup: %s", e)
     return msg.message_id
 
 
@@ -199,10 +244,10 @@ async def publish_document(
 ) -> Optional[int]:
     if not category:
         category = await classify_text(caption or "")
-    final_caption = await _append_category(caption, category)
+    final_caption = _append_category_tag(caption, category)
 
     msg = await _send_with_retry(
-        bot.send_document(
+        lambda: bot.send_document(
             chat_id=target_channel,
             document=file_id,
             caption=final_caption,
@@ -213,64 +258,73 @@ async def publish_document(
         return None
 
     markup = await build_reply_markup(msg.message_id)
-    await bot.edit_message_reply_markup(
-        chat_id=target_channel,
-        message_id=msg.message_id,
-        reply_markup=markup,
-    )
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=target_channel, message_id=msg.message_id, reply_markup=markup
+        )
+    except TelegramError as e:
+        logger.debug("edit_message_reply_markup: %s", e)
     return msg.message_id
 
 
 async def publish_album(
     bot: Bot,
     target_channel: str,
-    media_items: List[dict],  # [{"type": "photo"|"video", "file_id": ..., "caption": ...}]
+    media_items: List[dict],
     caption: str | None = None,
     parse_mode: str = "HTML",
     category: str | None = None,
 ) -> Optional[int]:
     """
-    Publish a MediaGroup album.  The category tag is appended to the caption
-    of the first item.  Returns the message_id of the first sent message.
+    Publish a MediaGroup album to the target channel.
+
+    Sends all items in a single send_media_group call so they appear as one
+    grouped post in the channel.  Reaction / ad buttons are attached via a
+    follow-up message containing an invisible Braille-space character so it
+    looks like a plain button row without visible text.
+
+    Returns the message_id of the first album message.
     """
     if not category:
         category = await classify_text(caption or "")
-    final_caption = await _append_category(caption, category)
+    final_caption = _append_category_tag(caption, category)
 
     media_group = []
     for i, item in enumerate(media_items):
         cap = final_caption if i == 0 else None
+        pm = parse_mode if cap else None
         if item["type"] == "photo":
-            media_group.append(InputMediaPhoto(
-                media=item["file_id"], caption=cap, parse_mode=parse_mode if cap else None))
+            media_group.append(InputMediaPhoto(media=item["file_id"], caption=cap, parse_mode=pm))
         elif item["type"] == "video":
-            media_group.append(InputMediaVideo(
-                media=item["file_id"], caption=cap, parse_mode=parse_mode if cap else None))
+            media_group.append(InputMediaVideo(media=item["file_id"], caption=cap, parse_mode=pm))
         elif item["type"] == "document":
-            media_group.append(InputMediaDocument(
-                media=item["file_id"], caption=cap, parse_mode=parse_mode if cap else None))
+            media_group.append(InputMediaDocument(media=item["file_id"], caption=cap, parse_mode=pm))
+
+    if not media_group:
+        return None
 
     messages = await _send_with_retry(
-        bot.send_media_group(chat_id=target_channel, media=media_group)
+        lambda: bot.send_media_group(chat_id=target_channel, media=media_group)
     )
     if not messages:
         return None
 
     first_msg_id = messages[0].message_id
-    # For albums, attach reaction buttons via a follow-up text message (Telegram
-    # doesn't support inline keyboards on media group messages)
-    discussion_url = await db.get_discussion_group()
-    ad_rows = await build_ad_rows()
-    reaction = _reaction_row(first_msg_id, 0, 0, discussion_url)
-    keyboard = InlineKeyboardMarkup(ad_rows + [reaction])
-
-    await _send_with_retry(
-        bot.send_message(
-            chat_id=target_channel,
-            text="↑ 互动",
-            reply_markup=keyboard,
+    markup = await build_reply_markup(first_msg_id)
+    # Follow-up message carries the reaction keyboard.
+    # U+2800 (Braille blank) is a valid non-empty character that renders invisibly,
+    # so the message appears as a clean button row with no caption text.
+    try:
+        await _send_with_retry(
+            lambda m=markup: bot.send_message(
+                chat_id=target_channel,
+                text="\u2800",
+                reply_markup=m,
+            )
         )
-    )
+    except TelegramError as e:
+        logger.debug("Album reaction follow-up failed: %s", e)
+
     return first_msg_id
 
 
@@ -281,14 +335,23 @@ async def publish_from_submission(
     category: str | None = None,
 ) -> Optional[int]:
     """
-    High-level: publish a submission dict (as stored in DB) to the channel.
+    High-level: publish a submission dict to the channel.
+    Signature is appended inline to the caption/text.
     Returns the new channel message_id.
     """
     data = submission["message_data"]
     ctype = submission["content_type"]
     sign = _build_signature(submission)
-    text = data.get("text", "")
-    caption_base = f"{text}\n\n{sign}" if sign else text
+    # Escape user-provided text so angle brackets don't break HTML parse_mode
+    text = html_module.escape(data.get("text", "") or "")
+
+    # Build caption with signature inline
+    if text and sign:
+        caption_base = f"{text}\n\n{sign}"
+    elif sign:
+        caption_base = sign
+    else:
+        caption_base = text
 
     if ctype == "text":
         return await publish_text(bot, target_channel, caption_base, category=category)
@@ -310,33 +373,17 @@ async def publish_from_submission(
         return None
 
 
-def _build_signature(submission: dict) -> str:
-    sign_type = submission["sign_type"]
-    if sign_type == "anonymous":
-        return ""
-    elif sign_type == "username":
-        username = submission.get("username", "")
-        return f"— @{username}" if username else ""
-    elif sign_type == "custom":
-        name = submission.get("custom_name", "")
-        return f"— {name}" if name else ""
-    return ""
-
-
 async def update_reaction_markup(
     bot: Bot,
     target_channel: str,
     message_id: int,
 ) -> None:
-    """Re-fetch counts and update the inline keyboard on a channel post."""
+    """Re-fetch reaction counts and update the inline keyboard."""
     likes, dislikes = await db.get_reaction_counts(message_id)
     markup = await build_reply_markup(message_id, likes, dislikes)
     try:
         await bot.edit_message_reply_markup(
-            chat_id=target_channel,
-            message_id=message_id,
-            reply_markup=markup,
+            chat_id=target_channel, message_id=message_id, reply_markup=markup
         )
     except TelegramError as e:
-        # Message not modified is fine — just log at DEBUG level
-        logger.debug("edit_message_reply_markup: %s", e)
+        logger.debug("update_reaction_markup: %s", e)

@@ -24,6 +24,7 @@ from telegram.ext import (
 import config
 from database import db
 from services.word_filter import invalidate_cache as invalidate_word_cache
+from services.classifier import invalidate_category_cache
 from utils.helpers import escape_html, format_ts
 
 logger = logging.getLogger(__name__)
@@ -324,33 +325,44 @@ async def cmd_deltarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 @super_only
 async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("用法：/addsource @频道")
+        await update.message.reply_text("用法：/addsource @频道用户名\n\n⚠️ 建议使用 @用户名 格式，纯数字 ID 可能导致 Pyrogram 无法加入频道。")
         return
     raw = context.args[0]
     try:
         chat = await context.bot.get_chat(raw)
-        # Extract username (strip @ if present, or use from chat object)
-        username = (chat.username or "").lstrip("@")
-        if not username and raw.startswith("@"):
-            username = raw.lstrip("@")
-        await db.add_source_channel(chat.id, chat.title or raw, username=username)
-        await db.log_action(update.effective_user.id, "add_source_channel", str(chat.id))
-        # Refresh running collector + auto-join (uses username if available)
-        collector = context.bot_data.get("collector")
-        if collector:
-            sources = await db.get_source_channels()
-            collector.refresh_sources_sync([s["channel_id"] for s in sources])
-            try:
-                await collector.join_channel(chat.id, username=username)
-            except Exception as je:
-                logger.warning("Auto-join %s failed: %s", chat.id, je)
-        uname_str = f" (@{username})" if username else ""
-        await update.message.reply_text(
-            f"✅ 已添加来源频道：{escape_html(chat.title or raw)}{uname_str} (<code>{chat.id}</code>)",
-            parse_mode="HTML",
-        )
     except Exception as e:
-        await update.message.reply_text(f"❌ 添加失败：{e}")
+        await update.message.reply_text(f"❌ 找不到该频道：{e}\n请确认频道用户名正确且 Bot 已加入该频道。")
+        return
+
+    # Extract username
+    username = (chat.username or "").lstrip("@")
+    if not username and raw.startswith("@"):
+        username = raw.lstrip("@")
+
+    await db.add_source_channel(chat.id, chat.title or raw, username=username)
+    await db.log_action(update.effective_user.id, "add_source_channel", str(chat.id))
+
+    # Refresh running collector + auto-join
+    collector = context.bot_data.get("collector")
+    join_ok = False
+    join_warn = ""
+    if collector:
+        sources = await db.get_source_channels()
+        collector.refresh_sources_sync([s["channel_id"] for s in sources])
+        join_ok = await collector.join_channel(chat.id, username=username)
+        if not join_ok:
+            join_warn = (
+                "\n\n⚠️ <b>Pyrogram 加入频道失败！</b>\n"
+                "采集功能可能无法生效。请检查：\n"
+                "• 采集账号是否已手动加入该频道\n"
+                "• 频道是否为私有频道（需先手动加入）"
+            )
+
+    uname_str = f" (@{username})" if username else ""
+    await update.message.reply_text(
+        f"✅ 已添加来源频道：{escape_html(chat.title or raw)}{uname_str} (<code>{chat.id}</code>){join_warn}",
+        parse_mode="HTML",
+    )
 
 
 @super_only
@@ -368,6 +380,8 @@ async def cmd_delsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if collector:
                 sources = await db.get_source_channels()
                 collector.refresh_sources_sync([s["channel_id"] for s in sources])
+                # Also tell Pyrogram to leave the channel so messages stop arriving
+                await collector.leave_channel(chat.id)
             await update.message.reply_text(f"✅ 已移除来源频道：<code>{chat.id}</code>", parse_mode="HTML")
         else:
             await update.message.reply_text("⚠️ 该频道不在来源列表中。")
@@ -698,6 +712,7 @@ async def cmd_addcat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     is_default = len(context.args) > 1 and context.args[1].lower() == "default"
     cat_id = await db.add_category(name, [], is_default=is_default)
     await db.log_action(update.effective_user.id, "add_category", f"name={name}, id={cat_id}")
+    invalidate_category_cache()
     await update.message.reply_text(f"✅ 分类 #{name} 已创建（ID: {cat_id}）。")
 
 
@@ -722,6 +737,7 @@ async def cmd_addkw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     kws = [k for k in cat["keywords"] if k.get("word") != word]
     kws.append({"word": word, "weight": weight})
     await db.update_category(cat_id, keywords=kws)
+    invalidate_category_cache()
     await update.message.reply_text(
         f"✅ 已为分类 #{cat['name']} 添加关键词「{word}」（权重:{weight}）。"
     )
@@ -736,6 +752,7 @@ async def cmd_delcat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ok = await db.delete_category(cat_id)
     if ok:
         await db.log_action(update.effective_user.id, "del_category", f"id={cat_id}")
+        invalidate_category_cache()
         await update.message.reply_text(f"✅ 分类 ID:{cat_id} 已删除。")
     else:
         await update.message.reply_text("⚠️ 分类不存在。")
@@ -809,6 +826,14 @@ _CN_CMD_PATTERNS = [
 ]
 
 _CN_CMD_HANDLERS: dict = {}
+
+
+def is_cn_command(text: str) -> bool:
+    """Return True if text matches any Chinese text command pattern."""
+    for pattern, _ in _CN_CMD_PATTERNS:
+        if pattern.match(text):
+            return True
+    return False
 
 
 async def handle_cn_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

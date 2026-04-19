@@ -29,6 +29,10 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.warning("Malformed reaction callback data: %s", query.data)
         return
 
+    if message_id <= 0 or message_id > 2_147_483_647:
+        logger.warning("Out-of-range message_id in reaction callback: %s", message_id)
+        return
+
     user_id = update.effective_user.id
 
     likes, dislikes = await db.toggle_reaction(message_id, user_id, reaction_type)

@@ -20,9 +20,9 @@ from telegram.ext import (
 
 import config
 from database import db
-from bot.handlers.admin_forward import handle_admin_message
+from bot.handlers.admin_forward import handle_admin_message, handle_admin_post_callback
 from bot.handlers.submissions import build_submission_conversation
-from bot.handlers.management import register_management_handlers
+from bot.handlers.management import register_management_handlers, is_cn_command
 from bot.handlers.reactions import handle_reaction
 from bot.handlers.callbacks import (
     handle_review_callback,
@@ -43,14 +43,63 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ── Global error handler ──────────────────────────────────────────────────────
+
+async def global_error_handler(update: object, context) -> None:
+    """
+    Catch all unhandled exceptions from PTB handlers and notify super admins.
+    Also logs the full traceback.
+    """
+    import traceback
+    err = context.error
+    tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    logger.error("Unhandled exception: %s", err, exc_info=err)
+
+    # Build a concise notification
+    update_info = ""
+    if isinstance(update, Update):
+        user = update.effective_user
+        chat = update.effective_chat
+        if user:
+            update_info += f"👤 用户：{user.id}"
+            if user.username:
+                update_info += f" (@{user.username})"
+            update_info += "\n"
+        if chat:
+            update_info += f"💬 对话：{chat.id} ({chat.type})\n"
+
+    text = (
+        f"🚨 <b>Bot 遇到错误</b>\n\n"
+        f"{update_info}"
+        f"❌ 错误类型：<code>{type(err).__name__}</code>\n"
+        f"📝 错误信息：<code>{str(err)[:300]}</code>\n\n"
+        f"请检查服务器日志获取完整堆栈信息。"
+    )
+
+    try:
+        admins = await db.list_admins()
+        super_ids = [a["user_id"] for a in admins if a["level"] == 1] or config.SUPER_ADMIN_IDS
+        for uid in super_ids:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+            except Exception as e:
+                logger.debug("Failed to send error alert to admin %s: %s", uid, e)
+    except Exception as e:
+        logger.error("global_error_handler notification failed: %s", e)
+
+
 # ── post_init: runs inside PTB's event loop ───────────────────────────────────
 
 async def post_init(application: Application) -> None:
     """Called by PTB after the Application is ready but before polling starts."""
 
     # 1. Initialise database
-    await db.init_db(config.DATABASE_PATH)
-    logger.info("Database initialised at %s", config.DATABASE_PATH)
+    try:
+        await db.init_db(config.DATABASE_PATH)
+        logger.info("Database initialised at %s", config.DATABASE_PATH)
+    except Exception as e:
+        logger.critical("Failed to initialise database: %s", e)
+        raise
 
     # 2. Seed super-admins
     for uid in config.SUPER_ADMIN_IDS:
@@ -94,7 +143,7 @@ async def post_init(application: Application) -> None:
             # Store reference so management handlers can call refresh_sources_sync()
             application.bot_data["collector"] = collector
             asyncio.create_task(collector.start())
-            asyncio.create_task(run_queue_consumer(application.bot))
+            asyncio.create_task(run_queue_consumer(application.bot, collector))
             logger.info("Collector and queue consumer tasks started.")
         except Exception as e:
             logger.error("Failed to start collector: %s", e)
@@ -146,6 +195,10 @@ async def _route_private_message(update: Update, context) -> None:
     """Route private messages: admins → forward; others → submission flow."""
     if not update.effective_user:
         return
+    msg = update.effective_message
+    text = (msg.text or "").strip() if msg else ""
+    if is_cn_command(text):
+        return  # handled by group=10 handle_cn_command
     if await db.is_admin(update.effective_user.id):
         await handle_admin_message(update, context)
 
@@ -173,6 +226,11 @@ def build_application() -> Application:
         group=2,
     )
 
+    # Admin post-to-channel callbacks (signature selection)
+    app.add_handler(
+        CallbackQueryHandler(handle_admin_post_callback, pattern=r"^admin_post:(anonymous|named|cancel)$")
+    )
+
     # Reaction callbacks
     app.add_handler(
         CallbackQueryHandler(handle_reaction, pattern=r"^react:(like|dislike):\d+$")
@@ -195,6 +253,9 @@ def build_application() -> Application:
     app.add_handler(
         CallbackQueryHandler(handle_custom_reason_start, pattern=r"^review_custom_reason:\d+$")
     )
+
+    # Global error handler — notify super admins on any unhandled exception
+    app.add_error_handler(global_error_handler)
 
     return app
 

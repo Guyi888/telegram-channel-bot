@@ -12,6 +12,7 @@ After confirmation the submission is written to DB and admins are notified.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import logging
 from collections import defaultdict
 from datetime import datetime
@@ -44,7 +45,6 @@ WAITING_REJECT_REASON = 5  # Admin sub-state (handled in callbacks.py)
 # ── MediaGroup collection ─────────────────────────────────────────────────────
 _pending_groups: Dict[str, List[Message]] = defaultdict(list)
 _pending_tasks: Dict[str, asyncio.Task] = {}
-_group_resolved: Dict[str, asyncio.Event] = {}
 
 
 # ── Conversation entry ────────────────────────────────────────────────────────
@@ -102,10 +102,18 @@ async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     msg = update.effective_message
 
-    # Guard: if already have a pending submission, don't treat this message as new content
-    # (this can happen with leftover state from previous interrupted conversations)
-    if context.user_data.get("submission") and context.user_data.get("sign_type") == "custom":
-        # User is likely trying to type their custom name; forward to handle_custom_name
+    # Admins have their own posting flow (admin_forward.py).
+    if await db.is_admin(user.id):
+        return ConversationHandler.END
+
+    # Guard: if album is already fully collected (flush task set submission),
+    # ignore stray messages so we don't overwrite the pending album.
+    existing_sub = context.user_data.get("submission", {})
+    if existing_sub.get("content_type") == "album" and not msg.media_group_id:
+        return WAITING_CONTENT
+
+    # Guard: custom name being typed
+    if existing_sub and context.user_data.get("sign_type") == "custom":
         return await handle_custom_name(update, context)
 
     if await db.is_blacklisted(user.id):
@@ -156,49 +164,52 @@ async def _store_single_message(msg: Message, user, context: ContextTypes.DEFAUL
 
 
 async def _collect_media_group(msg: Message, user, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Collect all messages in a media group (album).
+
+    Design: stay in WAITING_CONTENT so all subsequent album messages also call
+    receive_content and get added to the buffer.  The flush task (fired after
+    MEDIA_GROUP_DELAY with no new messages) sets context.user_data["submission"]
+    and shows the signature keyboard exactly once.  The keyboard callback
+    (sign:*) is also registered in WAITING_CONTENT state so it fires correctly.
+    """
     gid = msg.media_group_id
     _pending_groups[gid].append(msg)
-
-    if gid not in _group_resolved:
-        _group_resolved[gid] = asyncio.Event()
 
     if gid in _pending_tasks and not _pending_tasks[gid].done():
         _pending_tasks[gid].cancel()
 
     async def _flush():
-        try:
-            await asyncio.sleep(config.MEDIA_GROUP_DELAY)
-            messages = _pending_groups.pop(gid, [])
-            messages.sort(key=lambda m: m.message_id)
-            items = []
-            caption = ""
-            for i, m in enumerate(messages):
-                if i == 0:
-                    caption = extract_text(m)
-                if m.photo:
-                    items.append({"type": "photo", "file_id": m.photo[-1].file_id})
-                elif m.video:
-                    items.append({"type": "video", "file_id": m.video.file_id})
-                elif m.document:
-                    items.append({"type": "document", "file_id": m.document.file_id})
-            context.user_data["submission"] = {
-                "content_type": "album",
-                "message_data": {"items": items, "text": caption},
-                "raw_text": caption,
-            }
-        finally:
-            event = _group_resolved.get(gid)
-            if event:
-                event.set()
+        await asyncio.sleep(config.MEDIA_GROUP_DELAY)
+        messages = _pending_groups.pop(gid, [])
+        _pending_tasks.pop(gid, None)
+        if not messages:
+            return
+        messages.sort(key=lambda m: m.message_id)
+        items = []
+        caption = ""
+        for i, m in enumerate(messages):
+            if i == 0:
+                caption = extract_text(m)
+            if m.photo:
+                items.append({"type": "photo", "file_id": m.photo[-1].file_id})
+            elif m.video:
+                items.append({"type": "video", "file_id": m.video.file_id})
+            elif m.document:
+                items.append({"type": "document", "file_id": m.document.file_id})
+        context.user_data["submission"] = {
+            "content_type": "album",
+            "message_data": {"items": items, "text": caption},
+            "raw_text": caption,
+        }
+        # Show signature keyboard once for the whole album
+        await messages[0].reply_text("📝 请选择您的署名方式：", reply_markup=_signature_keyboard())
 
-    task = asyncio.get_event_loop().create_task(_flush())
+    task = asyncio.get_running_loop().create_task(_flush())
     _pending_tasks[gid] = task
 
-    event = _group_resolved.get(gid)
-    if event:
-        await event.wait()
-    _group_resolved.pop(gid, None)
-    return await _show_signature_options_raw(msg, context)
+    # Stay in WAITING_CONTENT so the next album messages are also handled by receive_content
+    return WAITING_CONTENT
 
 
 # ── Signature selection ───────────────────────────────────────────────────────
@@ -293,8 +304,8 @@ async def _show_preview(target, context: ContextTypes.DEFAULT_TYPE, update) -> i
 
     sign_labels = {
         "anonymous": "🕵️ 匿名投稿",
-        "username": f"👤 @{user.username or '未设置'}",
-        "custom": f"✏️ {custom_name}",
+        "username": f"👤 @{_html.escape(user.username or '未设置')}",
+        "custom": f"✏️ {_html.escape(custom_name)}",
     }
     sign_label = sign_labels.get(sign_type, "匿名")
 
@@ -310,7 +321,7 @@ async def _show_preview(target, context: ContextTypes.DEFAULT_TYPE, update) -> i
         f"<b>内容类型：</b>{ctype_label}\n"
     )
     if raw_text:
-        preview = raw_text[:200] + ("…" if len(raw_text) > 200 else "")
+        preview = _html.escape(raw_text[:200]) + ("…" if len(raw_text) > 200 else "")
         caption += f"<b>文字内容：</b>\n{preview}"
 
     keyboard = InlineKeyboardMarkup([
@@ -421,7 +432,7 @@ async def _notify_admins(bot: Bot, submission_id: int, user, sub: dict, sign_typ
     ctype_label = {"text": "文字", "photo": "图片", "video": "视频",
                    "document": "文件", "album": "相册", "audio": "音频"}.get(ctype, "内容")
     data = sub.get("message_data", {})
-    content_preview = data.get("text", "") or "[媒体文件]"
+    content_preview = _html.escape(data.get("text", "") or "[媒体文件]")
     if len(content_preview) > 300:
         content_preview = content_preview[:300] + "…"
 
@@ -509,6 +520,8 @@ def build_submission_conversation() -> ConversationHandler:
         states={
             WAITING_CONTENT: [
                 CallbackQueryHandler(handle_user_action, pattern=r"^user_action:"),
+                # Album flush task shows signature keyboard while still in WAITING_CONTENT
+                CallbackQueryHandler(handle_signature_choice, pattern=r"^sign:"),
                 MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, receive_content),
             ],
             WAITING_SIGNATURE: [

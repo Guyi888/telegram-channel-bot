@@ -143,13 +143,16 @@ class ChannelCollector:
         )
 
         # ── Register handlers BEFORE start() — required by Pyrogram v2 ──────────
-        # Use filters.channel to capture channel posts specifically.
-        # Also capture edited channel posts so updates are not missed.
-        @self._client.on_message(filters.channel)
+        # Use filters.channel | filters.group to capture both broadcast channels
+        # and megagroup/supergroup-type channels (some "channels" in Telegram are
+        # technically supergroups where only admins can post).
+        _ch_filter = filters.channel | filters.group
+
+        @self._client.on_message(_ch_filter)
         async def _on_channel_post(client, message):
             await self._handle_message(message)
 
-        @self._client.on_edited_message(filters.channel)
+        @self._client.on_edited_message(_ch_filter)
         async def _on_edited_channel_post(client, message):
             # Treat edits same as new posts so content is not missed
             await self._handle_message(message)
@@ -211,6 +214,25 @@ class ChannelCollector:
             except Exception as e:
                 logger.warning("join_chat(%s) skipped: %s", peer, e)
 
+        # Force pts sync for each source channel individually.
+        # get_dialogs(limit=200) can miss channels if the account has many dialogs
+        # and the newly joined channels land outside the first 200.
+        # Fetching 1 message per channel directly ensures Pyrogram registers the
+        # channel's pts and starts delivering real-time updates for it.
+        synced = 0
+        for src in sources:
+            cid = src["channel_id"]
+            username = (src.get("username") or "").strip()
+            peer = f"@{username}" if username else cid
+            try:
+                async for _ in self._client.get_chat_history(peer, limit=1):
+                    pass
+                synced += 1
+                logger.info("pts synced for channel %s (%s)", cid, peer)
+            except Exception as e:
+                logger.warning("pts sync failed for %s: %s", peer, e)
+        logger.info("pts sync completed for %d/%d source channels.", synced, len(sources))
+
     async def join_channel(self, channel_id: int, username: str = "") -> bool:
         """
         Join a channel so Pyrogram receives its messages.
@@ -225,6 +247,13 @@ class ChannelCollector:
             await self._client.join_chat(peer)
             self._monitored.add(channel_id)
             logger.info("Joined and now monitoring channel %s (%s)", channel_id, peer)
+            # Sync pts for this specific channel so Pyrogram delivers updates immediately
+            try:
+                async for _ in self._client.get_chat_history(peer, limit=1):
+                    pass
+                logger.info("pts synced for newly joined channel %s.", channel_id)
+            except Exception as sync_e:
+                logger.warning("pts sync after join failed for %s: %s", channel_id, sync_e)
             return True
         except Exception as e:
             logger.error("Failed to join channel %s (%s): %s", channel_id, peer, e)
@@ -298,38 +327,69 @@ class ChannelCollector:
         async with aiohttp.ClientSession() as session:
             for uid in super_admins:
                 try:
-                    await session.post(url, json={"chat_id": uid, "text": text})
+                    await session.post(url, json={"chat_id": uid, "text": text, "parse_mode": "HTML"})
                 except Exception as e:
                     logger.error("Failed to alert admin %s: %s", uid, e)
 
 
+async def _notify_channel_error(bot, html_text: str) -> None:
+    """Send a channel/collection error alert to all super admins."""
+    try:
+        admins = await db.list_admins()
+        super_ids = [a["user_id"] for a in admins if a["level"] == 1] or config.SUPER_ADMIN_IDS
+        for uid in super_ids:
+            try:
+                await bot.send_message(chat_id=uid, text=html_text, parse_mode="HTML")
+            except Exception as e:
+                logger.debug("Failed to send error alert to %s: %s", uid, e)
+    except Exception as e:
+        logger.error("_notify_channel_error failed: %s", e)
+
+
 # ── Queue consumer ────────────────────────────────────────────────────────────
 
-async def run_queue_consumer(bot) -> None:
+async def run_queue_consumer(bot, collector=None) -> None:
     """
-    Background task: continuously drain the message queue and publish
-    collected messages to the target channel via the Bot API.
+    Background task: drain the message queue and publish collected messages
+    to the target channel.
 
-    Uses copy_message where the bot has already uploaded the file (works for
-    messages the bot forwarded).  For messages collected by Pyrogram (file_id
-    from a different DC context), we use send_* methods with the file_id.
+    Album handling:
+      Messages sharing the same media_group_id are buffered together.
+      The timer for each group is set ONCE (on first encounter) and never
+      reset — this prevents the "never-flushed" bug where re-fetching the
+      same unprocessed rows would continuously reset the timer.
 
-    Flood-wait handling: catches RetryAfter and sleeps accordingly.
+      Once the group timer expires (>= MEDIA_GROUP_DELAY seconds) the whole
+      group is flushed.  Pyrogram is tried first to send a proper media-group
+      so items appear as a single album in the target channel; Bot API
+      individual copy_message is the fallback.
+
+    Deduplication:
+      buffered_ids tracks queue IDs already loaded into the buffer so the
+      same row is never double-added when the consumer re-fetches it on the
+      next poll cycle.
     """
-    from telegram.error import RetryAfter, TelegramError
     from services.publisher import (
         publish_text, publish_photo, publish_video, publish_document
     )
 
     logger.info("Queue consumer started.")
-    # MediaGroup aggregation buffer: {media_group_id: [item, ...]}
+
+    # {gid: [(queue_id, data), ...]}
     group_buffer: dict = {}
+    # {gid: first_seen_monotonic_time}  — set ONCE, never updated
     group_timer: dict = {}
+    # queue IDs already loaded into group_buffer (prevents double-buffering)
+    buffered_ids: set = set()
 
     while True:
         try:
-            items = await db.dequeue_messages(limit=config.QUEUE_BATCH_SIZE)
+            pyrogram_client = None
+            if collector is not None:
+                pyrogram_client = getattr(collector, "_client", None)
+
             target = await db.get_target_channel()
+            items = await db.dequeue_messages(limit=config.QUEUE_BATCH_SIZE)
 
             for item in items:
                 if not target:
@@ -338,25 +398,35 @@ async def run_queue_consumer(bot) -> None:
 
                 data = item["message_data"]
                 gid = data.get("media_group_id")
-                ctype = data.get("content_type", "text")
 
                 if gid:
-                    # Buffer for album aggregation
-                    if gid not in group_buffer:
-                        group_buffer[gid] = []
-                    group_buffer[gid].append((item["id"], data))
-                    group_timer[gid] = asyncio.get_event_loop().time()
+                    if item["id"] not in buffered_ids:
+                        if gid not in group_buffer:
+                            group_buffer[gid] = []
+                            # Set timer ONCE — never reset so it naturally expires
+                            group_timer[gid] = asyncio.get_event_loop().time()
+                        group_buffer[gid].append((item["id"], data))
+                        buffered_ids.add(item["id"])
                 else:
-                    await _publish_queue_item(bot, target, item["id"], data,
-                                               publish_text, publish_photo,
-                                               publish_video, publish_document)
+                    await _publish_queue_item(
+                        bot, target, item["id"], data,
+                        publish_text, publish_photo, publish_video, publish_document,
+                        pyrogram_client=pyrogram_client,
+                    )
 
-            # Flush aged media groups (older than MEDIA_GROUP_DELAY)
-            now = asyncio.get_event_loop().time()
-            for gid in list(group_buffer.keys()):
-                if now - group_timer.get(gid, now) >= config.MEDIA_GROUP_DELAY:
-                    await _flush_group(bot, target, gid, group_buffer.pop(gid, []))
-                    group_timer.pop(gid, None)
+            # Flush groups whose timer has expired
+            if target:
+                now = asyncio.get_event_loop().time()
+                for gid in list(group_buffer.keys()):
+                    if now - group_timer.get(gid, 0) >= config.MEDIA_GROUP_DELAY:
+                        group_items = group_buffer.pop(gid, [])
+                        group_timer.pop(gid, None)
+                        for qid, _ in group_items:
+                            buffered_ids.discard(qid)
+                        await _flush_group(
+                            bot, target, gid, group_items,
+                            pyrogram_client=pyrogram_client,
+                        )
 
         except Exception as e:
             logger.error("Queue consumer error: %s", e)
@@ -365,56 +435,112 @@ async def run_queue_consumer(bot) -> None:
 
 
 async def _copy_and_react(bot, target: str, source_channel_id: int,
-                          source_message_id: int) -> bool:
+                          source_message_id: int, pyrogram_client=None) -> bool:
     """
-    Copy a single message from a public source channel to the target channel
-    using Bot API copy_message, then attach reaction buttons.
-    Returns True on success.
+    Copy a single message from a source channel to the target channel, then
+    attach reaction buttons.  Returns True on success.
+
+    Copy strategy:
+      1. Pyrogram client (if available and connected) — the personal account is
+         a member of the source channel so copy_message always works.
+      2. Bot API copy_message — fallback (requires bot to be in source channel).
     """
     from telegram.error import RetryAfter, TelegramError
     from services.publisher import build_reply_markup
-    try:
-        msg = await bot.copy_message(
-            chat_id=target,
-            from_chat_id=source_channel_id,
-            message_id=source_message_id,
-        )
-        logger.info("Copied message %s from %s → %s (new id=%s)",
-                    source_message_id, source_channel_id, target, msg.message_id)
-        # Attach reaction / ad buttons
+
+    sent_msg_id: int | None = None
+
+    # ── Strategy 1: Pyrogram copy ─────────────────────────────────────────────
+    if pyrogram_client is not None:
         try:
-            markup = await build_reply_markup(msg.message_id)
+            is_connected = getattr(pyrogram_client, "is_connected", False)
+            if callable(is_connected):
+                is_connected = is_connected()
+        except Exception:
+            is_connected = False
+
+        if is_connected:
+            try:
+                result = await pyrogram_client.copy_message(
+                    chat_id=target,
+                    from_chat_id=source_channel_id,
+                    message_id=source_message_id,
+                )
+                sent_msg_id = result.id
+                logger.info(
+                    "Pyrogram-copied msg %s from %s → %s (new id=%s)",
+                    source_message_id, source_channel_id, target, sent_msg_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Pyrogram copy failed (src=%s msg=%s), trying Bot API: %s",
+                    source_channel_id, source_message_id, e,
+                )
+
+    # ── Strategy 2: Bot API copy_message (fallback) ───────────────────────────
+    if sent_msg_id is None:
+        try:
+            msg = await bot.copy_message(
+                chat_id=target,
+                from_chat_id=source_channel_id,
+                message_id=source_message_id,
+            )
+            sent_msg_id = msg.message_id
+            logger.info(
+                "Bot API-copied msg %s from %s → %s (new id=%s)",
+                source_message_id, source_channel_id, target, sent_msg_id,
+            )
+        except RetryAfter as e:
+            logger.warning("RetryAfter %ss copying msg %s", e.retry_after, source_message_id)
+            await asyncio.sleep(e.retry_after + 1)
+            return False
+        except TelegramError as e:
+            logger.error(
+                "copy_message failed (src=%s msg=%s): %s",
+                source_channel_id, source_message_id, e,
+            )
+            # Notify admins about persistent channel failure
+            await _notify_channel_error(
+                bot,
+                f"❗ 来源频道 <code>{source_channel_id}</code> 消息转发失败\n"
+                f"消息 ID：{source_message_id}\n"
+                f"错误：{e}\n\n"
+                f"可能原因：Bot 未加入该频道或消息已被删除。\n"
+                f"建议：删除该频道后用 @用户名 重新添加。"
+            )
+            return False
+
+    # ── Attach reaction / ad buttons ─────────────────────────────────────────
+    if sent_msg_id is not None:
+        try:
+            markup = await build_reply_markup(sent_msg_id)
             await bot.edit_message_reply_markup(
                 chat_id=target,
-                message_id=msg.message_id,
+                message_id=sent_msg_id,
                 reply_markup=markup,
             )
         except Exception as e:
-            logger.debug("Could not add reaction buttons to %s: %s", msg.message_id, e)
-        return True
-    except RetryAfter as e:
-        logger.warning("RetryAfter %ss copying msg %s", e.retry_after, source_message_id)
-        await asyncio.sleep(e.retry_after + 1)
-        return False
-    except TelegramError as e:
-        logger.error("copy_message failed (src=%s msg=%s): %s",
-                     source_channel_id, source_message_id, e)
-        return False
+            logger.debug("Could not add reaction buttons to %s: %s", sent_msg_id, e)
+
+    return sent_msg_id is not None
 
 
 async def _publish_queue_item(bot, target, queue_id, data,
                                publish_text, publish_photo,
-                               publish_video, publish_document) -> None:
+                               publish_video, publish_document,
+                               pyrogram_client=None) -> None:
     from telegram.error import RetryAfter
     ctype = data.get("content_type", "text")
 
     try:
         if ctype == "channel_message":
-            # New path: use Bot API copy_message (avoids Pyrogram↔BotAPI file_id mismatch)
+            # Use Pyrogram first (personal account is member of source channel),
+            # fall back to Bot API copy_message.
             await _copy_and_react(
                 bot, target,
                 data["source_channel_id"],
                 data["source_message_id"],
+                pyrogram_client=pyrogram_client,
             )
         elif ctype == "text":
             text = data.get("text", "")
@@ -439,27 +565,42 @@ async def _publish_queue_item(bot, target, queue_id, data,
         await db.mark_queue_processed(queue_id)  # Don't block the queue
 
 
-async def _flush_group(bot, target, gid, items) -> None:
+async def _flush_group(bot, target, gid, items, pyrogram_client=None) -> None:
     """
-    Publish a buffered MediaGroup.
+    Publish a buffered media group to the target channel.
 
-    For channel_message items we use copy_message for each message individually.
-    Telegram will group them visually in the target channel if they are sent
-    in rapid succession and share the same media_group_id (when using forwardMessage);
-    with copy_message each arrives as a separate message, which is acceptable.
+    Strategy (in order):
+      1. Pyrogram send_media_group — produces a proper grouped album in the
+         target channel.  Requires the personal account to be an admin of the
+         target channel.  Falls back to strategy 2 on any failure.
+      2. Bot API copy_message per item — items arrive as separate messages;
+         each gets its own reaction button row via _copy_and_react.
     """
     if not items or not target:
         return
 
+    all_channel_msgs = all(
+        d.get("content_type") == "channel_message" for _, d in items
+    )
+
+    # ── Strategy 1: Pyrogram send_media_group ────────────────────────────────
+    if all_channel_msgs and pyrogram_client and PYROGRAM_AVAILABLE:
+        sent_ok = await _try_pyrogram_album(pyrogram_client, bot, target, gid, items)
+        if sent_ok:
+            for queue_id, _ in items:
+                await db.mark_queue_processed(queue_id)
+            return
+
+    # ── Strategy 2: individual Bot API copy_message ───────────────────────────
     for queue_id, data in items:
         if data.get("content_type") == "channel_message":
             await _copy_and_react(
                 bot, target,
                 data["source_channel_id"],
                 data["source_message_id"],
+                pyrogram_client=pyrogram_client,
             )
         else:
-            # Legacy path for old-format queue items with file_id
             from services.publisher import publish_album
             file_id = data.get("file_id")
             if file_id:
@@ -469,5 +610,100 @@ async def _flush_group(bot, target, gid, items) -> None:
                                         [{"type": ctype, "file_id": file_id}],
                                         caption=data.get("text", ""))
                 except Exception as e:
-                    logger.error("Failed to flush legacy item in group %s: %s", gid, e)
+                    logger.error("Legacy album item failed (group %s): %s", gid, e)
         await db.mark_queue_processed(queue_id)
+
+
+async def _try_pyrogram_album(pyrogram_client, bot, target: str,
+                               gid, items) -> bool:
+    """
+    Try to send a collected album as a grouped message using the Pyrogram
+    personal-account client.
+
+    Steps:
+      1. Retrieve the original messages from the source channel.
+      2. Build Pyrogram InputMedia* objects from their file references.
+      3. Call client.send_media_group(target, media=[...]).
+      4. Attach reaction buttons via a Bot API follow-up message.
+
+    Returns True on success, False on any failure (caller falls back).
+
+    NOTE: The personal account must be an admin of the target channel for
+    step 3 to succeed.  If it is not, Pyrogram will raise ChatWriteForbidden
+    and we fall back gracefully.
+    """
+    try:
+        is_connected = getattr(pyrogram_client, "is_connected", False)
+        if callable(is_connected):
+            is_connected = is_connected()
+        if not is_connected:
+            return False
+
+        from pyrogram.types import (
+            InputMediaPhoto, InputMediaVideo,
+            InputMediaDocument, InputMediaAudio,
+        )
+
+        source_channel_id = items[0][1]["source_channel_id"]
+        message_ids = [d["source_message_id"] for _, d in items]
+        first_text = next(
+            (d["text"] for _, d in items if d.get("text")), ""
+        )
+
+        # Fetch the original messages from the source channel
+        source_msgs = await pyrogram_client.get_messages(
+            source_channel_id, message_ids
+        )
+        if not source_msgs:
+            return False
+
+        # get_messages may return a single Message instead of a list
+        if not isinstance(source_msgs, (list, tuple)):
+            source_msgs = [source_msgs]
+        source_msgs = [m for m in source_msgs if m and getattr(m, "id", None)]
+        source_msgs.sort(key=lambda m: m.id)
+
+        media_list = []
+        for i, msg in enumerate(source_msgs):
+            cap = first_text if i == 0 and first_text else None
+            if msg.photo:
+                media_list.append(InputMediaPhoto(msg.photo.file_id, caption=cap))
+            elif msg.video:
+                media_list.append(InputMediaVideo(msg.video.file_id, caption=cap))
+            elif msg.document:
+                media_list.append(InputMediaDocument(msg.document.file_id, caption=cap))
+            elif msg.audio:
+                media_list.append(InputMediaAudio(msg.audio.file_id, caption=cap))
+
+        if not media_list:
+            return False
+
+        # Resolve target for Pyrogram (accepts int or @username string)
+        t = str(target).strip()
+        target_peer = int(t) if t.lstrip("-").isdigit() else t
+
+        sent = await pyrogram_client.send_media_group(target_peer, media=media_list)
+        if not sent:
+            return False
+
+        if not isinstance(sent, (list, tuple)):
+            sent = [sent]
+
+        first_id = sent[0].id
+        from services.publisher import build_reply_markup
+        markup = await build_reply_markup(first_id)
+        try:
+            await bot.send_message(
+                chat_id=target,
+                text="\u2800",   # Braille blank — invisible follow-up for buttons
+                reply_markup=markup,
+            )
+        except Exception as e:
+            logger.debug("Album reaction follow-up failed (group %s): %s", gid, e)
+
+        logger.info("Pyrogram album group %s → %s (%d items)", gid, target, len(sent))
+        return True
+
+    except Exception as e:
+        logger.warning("_try_pyrogram_album failed (group %s): %s", gid, e)
+        return False
