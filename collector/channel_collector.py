@@ -224,22 +224,33 @@ class ChannelCollector:
             except Exception as e:
                 logger.warning("join_chat(%s) skipped: %s", peer, e)
 
-        # Initialise _last_msg_ids so polling doesn't re-process old messages.
-        # We fetch the latest message ID from each channel; any future message
-        # with a higher ID will be treated as new by the poll loop.
+        # Initialise _last_msg_ids.
+        # Fetch the last 11 messages; use the 11th as the baseline so the
+        # FIRST poll immediately picks up the 10 most recent messages already
+        # in each channel.  This lets admins see results right away without
+        # waiting for the source channels to post brand-new content.
+        # If the channel has fewer than 11 messages, start from 0 (collect all).
         synced = 0
         for src in sources:
             cid = src["channel_id"]
             username = (src.get("username") or "").strip()
             peer = f"@{username}" if username else cid
             try:
-                async for msg in self._client.get_chat_history(peer, limit=1):
-                    self._last_msg_ids[cid] = msg.id
-                    logger.info("pts/last_msg init: channel %s (%s) → msg_id %s", cid, peer, msg.id)
+                history: list = []
+                async for msg in self._client.get_chat_history(peer, limit=11):
+                    history.append(msg)
+                if history:
+                    # Set baseline to the 11th message (index 10); if fewer exist use 0
+                    baseline = history[10].id if len(history) >= 11 else 0
+                    self._last_msg_ids[cid] = baseline
+                    logger.info(
+                        "init channel %s (%s): latest_id=%s baseline=%s (will collect last %d msgs)",
+                        cid, peer, history[0].id, baseline, len(history) - (1 if len(history) >= 11 else 0)
+                    )
                 synced += 1
             except Exception as e:
-                logger.warning("pts init failed for %s: %s", peer, e)
-        logger.info("pts/last_msg init completed for %d/%d source channels.", synced, len(sources))
+                logger.warning("init failed for %s: %s", peer, e)
+        logger.info("Channel init completed for %d/%d source channels.", synced, len(sources))
 
     async def join_channel(self, channel_id: int, username: str = "") -> bool:
         """
@@ -255,13 +266,17 @@ class ChannelCollector:
             await self._client.join_chat(peer)
             self._monitored.add(channel_id)
             logger.info("Joined and now monitoring channel %s (%s)", channel_id, peer)
-            # Init last_msg_id so polling starts from the current tip
+            # Init last_msg_id: baseline at 11th-from-top so first poll collects last 10 msgs
             try:
-                async for msg in self._client.get_chat_history(peer, limit=1):
-                    self._last_msg_ids[channel_id] = msg.id
-                    logger.info("last_msg init for newly joined channel %s → %s", channel_id, msg.id)
+                history: list = []
+                async for msg in self._client.get_chat_history(peer, limit=11):
+                    history.append(msg)
+                if history:
+                    baseline = history[10].id if len(history) >= 11 else 0
+                    self._last_msg_ids[channel_id] = baseline
+                    logger.info("init newly joined channel %s: baseline=%s", channel_id, baseline)
             except Exception as sync_e:
-                logger.warning("last_msg init failed for %s: %s", channel_id, sync_e)
+                logger.warning("init failed for newly joined %s: %s", channel_id, sync_e)
             return True
         except Exception as e:
             logger.error("Failed to join channel %s (%s): %s", channel_id, peer, e)
@@ -355,11 +370,17 @@ class ChannelCollector:
                 try:
                     new_msgs: List = []
                     last_id = self._last_msg_ids.get(channel_id, 0)
+                    channel_latest_id = None
 
                     async for msg in self._client.get_chat_history(channel_id, limit=20):
+                        if channel_latest_id is None:
+                            channel_latest_id = msg.id
                         if msg.id <= last_id:
                             break  # already processed; messages are newest-first
                         new_msgs.append(msg)
+
+                    logger.info("Poll channel %s: stored_last=%s channel_latest=%s new_count=%d",
+                                channel_id, last_id, channel_latest_id, len(new_msgs))
 
                     if not new_msgs:
                         continue
