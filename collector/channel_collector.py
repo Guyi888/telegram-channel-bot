@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import config
 from database import db
@@ -126,6 +126,9 @@ class ChannelCollector:
         self._monitored: Set[int] = set()
         self._running = False
         self._retry_count = 0
+        # last processed message_id per channel — used for polling dedup
+        self._last_msg_ids: Dict[int, int] = {}
+        self._poll_task: Optional[asyncio.Task] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -171,6 +174,11 @@ class ChannelCollector:
                 # Refresh monitored channel set from DB and auto-join channels
                 await self._refresh_sources()
 
+                # Start backup polling loop as a concurrent task
+                self._poll_task = asyncio.get_running_loop().create_task(
+                    self._poll_channels()
+                )
+
                 # Keep running indefinitely
                 await asyncio.Event().wait()
 
@@ -192,6 +200,8 @@ class ChannelCollector:
 
     async def stop(self) -> None:
         self._running = False
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
         if self._client and self._client.is_connected:
             await self._client.stop()
             logger.info("Pyrogram collector stopped.")
@@ -214,24 +224,22 @@ class ChannelCollector:
             except Exception as e:
                 logger.warning("join_chat(%s) skipped: %s", peer, e)
 
-        # Force pts sync for each source channel individually.
-        # get_dialogs(limit=200) can miss channels if the account has many dialogs
-        # and the newly joined channels land outside the first 200.
-        # Fetching 1 message per channel directly ensures Pyrogram registers the
-        # channel's pts and starts delivering real-time updates for it.
+        # Initialise _last_msg_ids so polling doesn't re-process old messages.
+        # We fetch the latest message ID from each channel; any future message
+        # with a higher ID will be treated as new by the poll loop.
         synced = 0
         for src in sources:
             cid = src["channel_id"]
             username = (src.get("username") or "").strip()
             peer = f"@{username}" if username else cid
             try:
-                async for _ in self._client.get_chat_history(peer, limit=1):
-                    pass
+                async for msg in self._client.get_chat_history(peer, limit=1):
+                    self._last_msg_ids[cid] = msg.id
+                    logger.info("pts/last_msg init: channel %s (%s) → msg_id %s", cid, peer, msg.id)
                 synced += 1
-                logger.info("pts synced for channel %s (%s)", cid, peer)
             except Exception as e:
-                logger.warning("pts sync failed for %s: %s", peer, e)
-        logger.info("pts sync completed for %d/%d source channels.", synced, len(sources))
+                logger.warning("pts init failed for %s: %s", peer, e)
+        logger.info("pts/last_msg init completed for %d/%d source channels.", synced, len(sources))
 
     async def join_channel(self, channel_id: int, username: str = "") -> bool:
         """
@@ -247,13 +255,13 @@ class ChannelCollector:
             await self._client.join_chat(peer)
             self._monitored.add(channel_id)
             logger.info("Joined and now monitoring channel %s (%s)", channel_id, peer)
-            # Sync pts for this specific channel so Pyrogram delivers updates immediately
+            # Init last_msg_id so polling starts from the current tip
             try:
-                async for _ in self._client.get_chat_history(peer, limit=1):
-                    pass
-                logger.info("pts synced for newly joined channel %s.", channel_id)
+                async for msg in self._client.get_chat_history(peer, limit=1):
+                    self._last_msg_ids[channel_id] = msg.id
+                    logger.info("last_msg init for newly joined channel %s → %s", channel_id, msg.id)
             except Exception as sync_e:
-                logger.warning("pts sync after join failed for %s: %s", channel_id, sync_e)
+                logger.warning("last_msg init failed for %s: %s", channel_id, sync_e)
             return True
         except Exception as e:
             logger.error("Failed to join channel %s (%s): %s", channel_id, peer, e)
@@ -279,23 +287,106 @@ class ChannelCollector:
     async def _handle_message(self, message) -> None:
         """Called for every channel post the personal account receives."""
         chat_id = getattr(message.chat, "id", None)
-        logger.info("Received channel message: chat_id=%s monitored=%s",
-                    chat_id, chat_id in self._monitored)
+        msg_id = getattr(message, "id", 0)
+        logger.info("Received channel message: chat_id=%s msg_id=%s monitored=%s",
+                    chat_id, msg_id, chat_id in self._monitored)
 
         # Only process messages from monitored channels
         if chat_id not in self._monitored:
             return
 
+        # Deduplication: skip if already handled by polling or a previous call
+        last = self._last_msg_ids.get(chat_id, 0)
+        if msg_id and msg_id <= last:
+            logger.debug("Skipping already-processed msg %s from %s", msg_id, chat_id)
+            return
+
         # Ad / spam filter
         if await _is_ad_message(message):
-            logger.info("Dropped ad message %s from channel %s", message.id, chat_id)
+            logger.info("Dropped ad message %s from channel %s", msg_id, chat_id)
+            if msg_id:
+                self._last_msg_ids[chat_id] = max(last, msg_id)
             return
 
         # Serialise message to a dict for the queue
         data = await self._serialize_message(message)
         await db.enqueue_message(chat_id, data)
         logger.info("Queued message %s from channel %s (type=%s)",
-                    message.id, chat_id, data.get("content_type"))
+                    msg_id, chat_id, data.get("content_type"))
+
+        # Update last seen ID so polling won't re-process this
+        if msg_id:
+            self._last_msg_ids[chat_id] = max(last, msg_id)
+
+    async def _poll_channels(self) -> None:
+        """
+        Backup polling loop — runs every 60 s and fetches the latest messages
+        from every monitored channel.
+
+        Why this exists:
+          Pyrogram's real-time update handler only fires for channels whose pts
+          is already tracked in the session (i.e. channels the account joined
+          BEFORE the current session was created).  Newly joined channels often
+          don't deliver real-time updates until the session is restarted because
+          Telegram requires a GetChannelDifference handshake that Pyrogram
+          doesn't perform automatically for freshly joined channels.
+
+          This loop bridges that gap: even if real-time updates never arrive,
+          new messages are caught within POLL_INTERVAL seconds.
+
+        Deduplication:
+          _last_msg_ids[channel_id] stores the highest message_id already
+          processed (by this loop OR by the real-time handler).  We only
+          enqueue messages with id > that value.
+        """
+        POLL_INTERVAL = getattr(config, "COLLECTOR_POLL_INTERVAL", 60)
+        logger.info("Backup polling loop started (interval=%ss).", POLL_INTERVAL)
+        poll_count = 0
+
+        while self._running:
+            await asyncio.sleep(POLL_INTERVAL)
+            if not self._running or not self._client:
+                break
+
+            poll_count += 1
+            logger.info("Poll #%d: checking %d source channels...", poll_count, len(self._monitored))
+
+            for channel_id in list(self._monitored):
+                try:
+                    new_msgs: List = []
+                    last_id = self._last_msg_ids.get(channel_id, 0)
+
+                    async for msg in self._client.get_chat_history(channel_id, limit=20):
+                        if msg.id <= last_id:
+                            break  # already processed; messages are newest-first
+                        new_msgs.append(msg)
+
+                    if not new_msgs:
+                        continue
+
+                    # Process in chronological order (oldest → newest)
+                    new_msgs.reverse()
+                    for msg in new_msgs:
+                        if await _is_ad_message(msg):
+                            logger.info("Poll: dropped ad msg %s from %s", msg.id, channel_id)
+                            continue
+                        data = await self._serialize_message(msg)
+                        await db.enqueue_message(channel_id, data)
+                        logger.info("Poll: queued msg %s from channel %s (type=%s)",
+                                    msg.id, channel_id, data.get("content_type"))
+
+                    # Advance the high-water mark
+                    max_id = max(m.id for m in new_msgs)
+                    self._last_msg_ids[channel_id] = max(
+                        self._last_msg_ids.get(channel_id, 0), max_id
+                    )
+
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.warning("Poll error for channel %s: %s", channel_id, e)
+
+        logger.info("Backup polling loop stopped.")
 
     async def _serialize_message(self, message) -> dict:
         """
